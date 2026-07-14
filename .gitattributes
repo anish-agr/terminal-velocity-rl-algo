@@ -8,22 +8,3 @@
 
 *scripts/zipalgo_linux binary
 
-# Compiled/binary artifacts — MUST be excluded from the `* text eol=lf` rule
-# above, which otherwise runs CRLF->LF normalization on them. That rule is
-# exactly what corrupted sim/terminal_sim.pyd (a CRLF byte pair inside the DLL
-# was collapsed, shrinking it by 1 byte and breaking the PE header offsets —
-# every historical blob of it is dead; rebuild + recommit from source).
-*.pyd binary
-*.so binary
-*.dll binary
-*.bin binary
-*.pt binary
-*.whl binary
-scripts/test_algo_* binary
-
-# Fidelity-gate corpus: the pod's setup_runpod.sh gate must diff replays that
-# are BYTE-IDENTICAL to the ones validated locally. Some carry CRLF line
-# endings; both parsers (replay.rs, replay_utils.py) handle either, but the
-# gate inputs must never be rewritten in transit.
-*.replay -text
-

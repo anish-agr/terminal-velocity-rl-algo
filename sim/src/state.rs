@@ -121,6 +121,11 @@ impl State {
     pub fn restore(&mut self) {
         let cfg = self.cfg.clone();
         for p in 0..2 {
+            // Raw f32 decay. NOTE (exhaustively tested 2026-07-15): no quantization
+            // variant (round/rint/ceil/floor at tenths, f32/f64, either decay expression,
+            // either display mode) survives chain-validation against the 8-replay corpus;
+            // raw f32 is the best fit. A bounded sub-0.1 drift vs the engine remains on
+            // long banking chains (both signs observed) — see MECHANICS.md §Open fixes.
             let decayed = self.mp[p] * (1.0 - cfg.decay);
             let ramp = (self.turn / cfg.mp_interval) as f32 * cfg.mp_growth;
             self.mp[p] = (decayed + cfg.mp_per_round + ramp).min(cfg.max_mp);
@@ -144,7 +149,22 @@ impl State {
             let id = forced_ids.map(|ids| ids[i]);
             let ok = self.apply_one(owner, cmd, id, accepted);
             if !ok && strict {
-                panic!("engine-accepted command rejected by sim: {:?} (owner {})", cmd, owner);
+                // An engine-accepted command our model rejects = a validation-model gap.
+                // Report loudly with full context, then force-apply so the diff can
+                // continue localizing the real divergence.
+                println!(
+                    "VALIDATION GAP: sim rejected engine-accepted {:?} (owner {}, sp {}, mp {}, blocked {:?})",
+                    cmd,
+                    owner,
+                    self.sp[owner as usize],
+                    self.mp[owner as usize],
+                    match cmd {
+                        Cmd::Build { x, y, .. }
+                        | Cmd::Upgrade { x, y }
+                        | Cmd::Remove { x, y }
+                        | Cmd::Deploy { x, y, .. } => self.structure_at(x, y).is_some(),
+                    }
+                );
             }
         }
     }

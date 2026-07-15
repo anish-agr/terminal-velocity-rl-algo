@@ -1,10 +1,63 @@
 # Terminal Engine Mechanics — VERIFIED SPEC (this competition's ruleset)
 
-Status: **frame-exact vs engine.jar across the full corpus** (4 matches, 2,719 action
-frames: starter mirror, torture mirror, torture-vs-starter, probe-vs-torture). Unit
-positions/healths/events bit-exact; resources within one display tick (see §Serialization).
-Verification tool: `sim/target/release/tsim diff <replay>`. Re-run on every sim change and
-on every new replay.
+Status: **frame-exact vs engine.jar across the local corpus** (4 matches, 2,719 action
+frames). **Production-server replays** (pulled via
+`https://terminal.c1games.com/api/game/replayexpanded/<id>` — public, no auth) confirm the
+server runs the same engine and a gameplay-identical config (diffs are icon fields only).
+Two gaps surfaced by server replays, both characterized (see §Open fixes). Verification
+tool: `sim/target/release/tsim diff <replay>`. Re-run on every sim change and every new
+replay.
+
+## Open fixes (root-caused, exact fix logic specified — implement in this order)
+
+1. **Self-destruct AoE must hit 0-health units too.** The engine's SD damages every enemy
+   unit in range whose removal hasn't happened yet (step 4), INCLUDING units already at
+   ≤0 health from earlier SDs this frame; our sim filters `health > 0`, producing fewer
+   damage events and shorter SD target lists (ladder replay turns 7/12/14/19: sim damage
+   15 vs engine 20, etc.). FIX: in the SD branch of the movement step, drop the
+   `health > 0` filters on both mobile and structure targets (keep `alive`); the 0-health
+   exclusion applies to ATTACK targeting only. Gate: both ladder replays reach the same
+   pass-rate profile as the platform-probe replay.
+2. **Shield-pool micro-dust (±4e-6 HP).** Platform 100-turn replay: units with many
+   stacked grants (8 observed) differ from the engine by ~4e-6 (sim 11.600002 vs engine
+   11.599998) — the engine computes the grant amount along a different float path than
+   our f32 chain (likely f64 `shieldPerUnit + bonus*y` cast to f32 once). FIX (two-part):
+   (a) compute the amount in f64, cast to f32 at grant time; if residue persists, (b) add
+   a relative epsilon of 1e-4 to the diff's unit-health comparison ONLY (never to
+   positions/events), documented as characterized dust. Materiality: damage values are
+   integers; a 4e-6 health offset changes a kill threshold only if effective health sits
+   within 4e-6 of an exact damage multiple — negligible, but keep exactness where free.
+3. **Bounded MP micro-drift on long banking chains (BOTH signs, ≤ ~0.1).** Exhaustive
+   model search (32 variants: f32/f64 × mul/sub × {none, round, rint, ceil, floor}-at-
+   tenths × ceil/round display) — NO variant survives chain validation across the corpus;
+   the pure-banking chain in ladder-15330187 requires engine-internal values that cannot
+   arise from ANY function of the displayed state (t2 must exceed 8.7627 while exact
+   arithmetic from turn 0 gives 8.75; yet at t17 the engine sits BELOW the raw chain).
+   Model kept: raw f32 (best fit, simplest). Consequences + mitigations:
+   - replay harness: per-turn resync + one-display-tick stats tolerance (in place);
+   - deployment: read own resources from the server state every turn; plan spends with a
+     0.1 margin at integer boundaries; deploys the engine can't afford are SILENTLY
+     SKIPPED, so optimistic attempts are free — attempt the marginal unit, never rely on it;
+   - self-play training: unaffected (the sim is its own engine, exactly self-consistent).
+
+## External bug-report audit (2026-07-15) — verify before "fixing"
+
+Three reported "critical bugs" were tested against engine data. Verdicts:
+- **"Shields are capped / max-overwrite instead of additive" — REFUTED.** The platform
+  100-turn replay shows one unit receiving 8 separate shield grants; an interceptor
+  reached 56.6 HP (40 + 16.6) and a demolisher 46.6 (5 + 41.6). Pure summation passes
+  4,094/4,114 frames on that replay. No 44.1-HP unit exists anywhere in the corpus. The
+  rules page also states "no limit to the amount of shielding". Do NOT change.
+- **"Frame order must be shields → movement → attacks" — REFUTED.** Dispositive event
+  evidence: scouts spawned at (13,0) inside a support's range receive their grant with
+  target location (13,1) — their POST-move tile (turn-5/7 frame-0 shield events, local
+  corpus). Movement→shields→attacks passes 7,500+ frames including production. Reverting
+  to the rules-page order would itself introduce the 1-frame lag the report describes.
+- **"Engine quantizes MP to tenth/hundredth after decay; spawn accepted at 1.0 vs sim
+  0.9977" — MECHANISM REFUTED, underlying issue REAL.** All quantization variants fail
+  chain validation (see Open fix 3, which also covers the affordability symptom: engine
+  accepted deploys our chain under-affords by <0.1). Handled by Open fix 3 mitigations,
+  not by quantizing.
 
 ## Numerics (hard-won, do not regress)
 

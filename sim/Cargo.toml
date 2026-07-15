@@ -1,0 +1,25 @@
+[package]
+name = "terminal-sim"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "terminal_sim"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "tsim"
+path = "src/main.rs"
+
+[features]
+python = ["dep:pyo3"]
+
+[dependencies]
+serde_json = "1"
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py38", "generate-import-lib"], optional = true }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

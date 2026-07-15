@@ -319,7 +319,9 @@ pub fn play_turn(
                                 continue;
                             }
                             let o = &st.mobiles[oi];
-                            if !o.alive || o.owner == owner || o.health <= 0.0 {
+                            // ≤0-health units still take SD damage (they are only
+                            // removed at step 4) — ladder-replay-confirmed
+                            if !o.alive || o.owner == owner {
                                 continue;
                             }
                             if geo::dist2(x as i32, y as i32, o.x as i32, o.y as i32) <= thr {
@@ -338,7 +340,7 @@ pub fn play_turn(
                                 }
                                 if let Some(sidx) = st.structure_at(tx as i8, ty as i8) {
                                     let s = &st.structures[sidx];
-                                    if s.owner != owner && s.alive && s.health > 0.0 {
+                                    if s.owner != owner && s.alive {
                                         let (sx2, sy2, skind, sowner) = (s.x, s.y, s.kind, s.owner);
                                         st.structures[sidx].health -= stats.sd_tower;
                                         summary.structure_damage_dealt[owner as usize] +=
@@ -370,8 +372,11 @@ pub fn play_turn(
             }
             let stats = cfg.stats(config::SUPPORT, s.upgraded);
             let thr = cfg.shield_d2[config::SUPPORT as usize][s.upgraded as usize];
-            let own_y = if s.owner == 0 { s.y as f32 } else { (27 - s.y) as f32 };
-            let amount = stats.shield_per_unit + stats.shield_bonus_per_y * own_y;
+            let own_y = if s.owner == 0 { s.y as f64 } else { (27 - s.y) as f64 };
+            // engine computes the grant amount in double, then narrows once
+            // (platform replay: stacked pools match f64-then-f32, not an f32 chain)
+            let amount =
+                (stats.shield_per_unit as f64 + stats.shield_bonus_per_y as f64 * own_y) as f32;
             let (sx, sy, sowner) = (s.x, s.y, s.owner);
             for mi in 0..st.mobiles.len() {
                 let m = &st.mobiles[mi];

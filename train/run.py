@@ -209,6 +209,21 @@ def phase_loop(cfg: dict, config: dict, run_dir: str, hours: float,
                         daemon=True)
     server.start()
 
+    # A previous phase's league.json may reference snapshot models; the fresh
+    # server only knows current/bc, and an actor sampling an unknown model_id
+    # gets a KeyError (a dead actor for the rest of the run). Preload them.
+    league_file = os.path.join(run_dir, "league.json")
+    if os.path.exists(league_file):
+        from .league import League
+        try:
+            lg = League(cfg)
+            lg.load(league_file)
+            for snap in lg.snapshots:
+                if os.path.exists(snap.path):
+                    request_q.put(("load_model", snap.id, snap.path))
+        except Exception as exc:
+            print("league preload skipped: {!r}".format(exc), flush=True)
+
     from .actor import run_actor
     factory = GameFactory(json.dumps(config))
     actors = []
@@ -222,18 +237,21 @@ def phase_loop(cfg: dict, config: dict, run_dir: str, hours: float,
     print("loop: {} actors + server up; running {:.1f} h".format(
         n_actors, hours), flush=True)
 
-    deadline = time.time() + hours * 3600.0
+    # both bounds are real: max_steps caps the schedule horizon, deadline_ts
+    # caps wall-clock (the pilot's "2 h" is a hard stop, not advisory — its
+    # gate must be readable on schedule)
+    deadline = None if hours >= 1e6 else time.time() + hours * 3600.0
     try:
         run_learner(trajectory_q, request_q, cfg, config, run_dir,
                     device="cuda" if _cuda() else "cpu",
                     max_steps=None if hours >= 1e6 else
-                    int(cfg["learning"]["total_steps"]))
+                    int(cfg["learning"]["total_steps"]),
+                    deadline_ts=deadline)
     finally:
         request_q.put(("stop",))
         for p in actors:
             p.terminate()
         server.terminate()
-    del deadline  # learner max_steps bounds the run; hours is advisory
 
 
 # ---------------------------------------------------------------------------

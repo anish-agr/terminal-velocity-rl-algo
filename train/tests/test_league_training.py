@@ -278,7 +278,9 @@ def test_plan_masks_replay():
     tm2, _, _, l2 = plan_masks(
         (Token(5, xy_loc(13, 0), 7), Token(END, 0, 0)),
         PlanScratch(costs, 0.0, 0.05), 6)
-    assert l2 == 1                                  # unaffordable deploy truncates
+    # unaffordable-from-token-0 plan: length 0, so the learner zeroes the row
+    # instead of gathering the -1e9-masked illegal token (loss poisoning)
+    assert l2 == 0
 
 
 def test_learner_step_and_overfit():

@@ -248,11 +248,16 @@ impl State {
                 self.sp[owner as usize] -= base.upgrade_cost_sp;
                 let up = cfg.stats(kind, true);
                 let missing = max_health - health;
+                // Upgrading assigns a NEW engine id/seq to the structure (replay-confirmed:
+                // build id 143 then upgrade id 158 at the same tile) — it re-enters the
+                // attack creation-order at the back, not at its original build position.
+                let id = self.take_id(forced_id);
                 let s = &mut self.structures[idx];
                 s.upgraded = true;
                 s.max_health = up.start_health;
                 s.health = up.start_health - missing; // missing health persists
-                let id = self.take_id(forced_id);
+                s.id = id;
+                s.seq = id;
                 accepted.push((cmd, id));
                 true
             }
@@ -333,9 +338,12 @@ impl State {
                 invested += base.upgrade_cost_sp;
             }
             let refund_pct = cfg.stats(kind, upgraded).refund_pct;
-            // refund quantized to a tenth (rules text + corpus: SP displays match only
-            // with snapped refunds)
-            let refund = refund_pct * invested * (health / max_health);
+            // Refund is rounded to the nearest tenth PER STRUCTURE before being credited
+            // (confirmed 229/229 on isolated single-remove-turn events scanned across 400
+            // scraped replays: round-half-up matches every observed SP delta; raw sum
+            // matches only 184/229, floor only 206/229). Round, not floor or ceil.
+            let raw = refund_pct * invested * (health / max_health);
+            let refund = (raw * 10.0 + 0.5).floor() / 10.0;
             self.sp[owner as usize] += refund;
             self.structures[i].alive = false;
             self.grid[gi(x, y)] = EMPTY;

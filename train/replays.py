@@ -35,10 +35,12 @@ from typing import Dict, Iterator, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 
-# scripts/ is not a package; it is the format authority for .replay files.
+# scripts/ is not a package; it is the format authority for .replay files
+# AND for config equivalence (scrape_replays admitted the corpus).
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO, "scripts"))
 from replay_utils import load_replay  # noqa: E402
+from scrape_replays import gameplay_fingerprint  # noqa: E402
 
 from .features import DeployHistory, GRID, N_PLANES, N_SCALARS  # noqa: E402
 from .tokens import Costs, Token, decode_commands, in_arena  # noqa: E402
@@ -47,13 +49,6 @@ _STRUCT_KINDS = (0, 1, 2)
 _MOBILE_KINDS = (3, 4, 5)
 _UPGRADE_LIST_IDX = 7
 
-# gameplay-relevant config fields (icon/display fields differ harmlessly)
-_UNIT_FIELDS = (
-    "cost1", "cost2", "startHealth", "attackDamageWalker", "attackDamageTower",
-    "attackRange", "shieldPerUnit", "shieldRange", "shieldBonusPerY", "speed",
-    "selfDestructDamageWalker", "selfDestructDamageTower", "selfDestructRange",
-    "selfDestructStepsRequired", "playerBreachDamage", "refundPercentage",
-)
 
 
 class TurnRecord(NamedTuple):
@@ -90,21 +85,18 @@ class Position(NamedTuple):
 # ---------------------------------------------------------------------------
 
 def config_matches(ours: dict, theirs: dict) -> bool:
-    """Gameplay-field equality on unitInformation + resources (§7 scraping)."""
+    """Gameplay-field equality via the scraper's fingerprint (§7) — the SAME
+    comparison that admitted the corpus, so ingestion can never disagree with
+    scraping about which replays match. Strict field equality is wrong here:
+    local configs carry the deprecated coresForPlayerDamage resources key the
+    server omits, and omit numeric fields the server serializes as explicit
+    0.0 (missing == 0.0 to the engine). Both normalizations live in
+    gameplay_fingerprint; keeping a second comparison here is how the whole
+    corpus once became silently un-ingestable (every replay config-skipped ->
+    a zero-position BC warm start)."""
     try:
-        a, b = ours["unitInformation"], theirs["unitInformation"]
-        if len(a) != len(b):
-            return False
-        for ua, ub in zip(a, b):
-            for f in _UNIT_FIELDS:
-                if ua.get(f) != ub.get(f):
-                    return False
-            upa, upb = ua.get("upgrade", {}), ub.get("upgrade", {})
-            for f in _UNIT_FIELDS:
-                if upa.get(f) != upb.get(f):
-                    return False
-        return ours["resources"] == theirs["resources"]
-    except (KeyError, TypeError):
+        return gameplay_fingerprint(ours) == gameplay_fingerprint(theirs)
+    except Exception:
         return False
 
 

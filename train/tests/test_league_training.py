@@ -15,6 +15,7 @@ import os
 import queue
 import tempfile
 import threading
+import time
 
 import numpy as np
 
@@ -55,6 +56,7 @@ _CFG = {
     },
     "actors": {"per_vcpu": 2, "infer_batch_max": 64, "infer_batch_wait_ms": 3.0,
                "weight_reload_s": 120, "seeded_start_frac": 0.0},
+    "schedule": {"checkpoint_min": 10},
 }
 
 
@@ -357,6 +359,48 @@ def test_buffer_mirror():
         assert s["board"].shape == (18, 28, 28)
         for plan in s["candidates"]:
             assert plan[-1].type == END
+
+
+def test_run_learner_resumes_and_preserves_league():
+    """run_learner must CONTINUE from run_dir (run.py's phase contract):
+    reload checkpoint.pt (net+opt+step), keep league.json's anchor flag /
+    snapshot pool / id counter instead of clobbering them with a fresh
+    League, and write a final checkpoint on exit for the next phase."""
+    import torch
+
+    from train.learner import run_learner
+
+    cfg = copy.deepcopy(_CFG)
+    with tempfile.TemporaryDirectory() as td:
+        boot = Learner(cfg, _CONFIG, seed=0)
+        boot.step_count = 7
+        boot.save_checkpoint(os.path.join(td, "checkpoint.pt"))
+        boot.export_weights(os.path.join(td, "weights_current.pt"))
+        lg = League(cfg)
+        lg.has_anchor = True
+        sid = lg.add_snapshot(os.path.join(td, "snap.pt"))
+        lg.save(os.path.join(td, "league.json"))
+
+        # one real game in the queue (the league.save clobber only runs on
+        # iterations that ingested something), then a ~2 s deadline
+        meta, positions = _run_one_game()
+        tq = queue.Queue()
+        tq.put(({"opponent_kind": "current", "winner": meta["winner"],
+                 "me": 0}, positions))
+        run_learner(tq, queue.Queue(), cfg, _CONFIG, td,
+                    deadline_ts=time.time() + 2.0)
+
+        fresh = Learner(cfg, _CONFIG, seed=1)
+        fresh.load_checkpoint(os.path.join(td, "checkpoint.pt"))
+        assert fresh.step_count == 7                     # step survived
+        for a, b in zip(fresh.net.state_dict().values(),
+                        boot.net.state_dict().values()):
+            assert torch.equal(a, b)                     # BC weights survived
+        lg2 = League(cfg)
+        lg2.load(os.path.join(td, "league.json"))
+        assert lg2.has_anchor                            # flag not clobbered
+        assert [s.id for s in lg2.snapshots] == [sid]    # pool not clobbered
+        assert lg2._counter == 1                         # ids keep counting
 
 
 def main():

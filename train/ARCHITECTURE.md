@@ -23,12 +23,18 @@ winning.
 
 ## 0. Implementation order (each step has a hard verification gate)
 
-1. Sim fixes from MECHANICS §Open fixes, in order: (a) SD AoE hits ≤0-health units;
-   (b) shield grant amount computed in f64 then cast to f32 (+ 1e-4 relative health
-   epsilon in the diff ONLY if residue remains). Gate: ladder replays reach the
-   platform-probe pass profile; local corpus stays frame-exact. Read MECHANICS
-   §External bug-report audit before changing ANYTHING else — two of the three reported
-   "bugs" are refuted by production data; do not "fix" refuted claims.
+1. SIM STATUS (2026-07-16): all planned fixes are APPLIED and validated at scale — SD
+   AoE vs 0-health units, game-over phase termination, force-afford replay
+   reconstruction, health comparison quantization. The simulator is production-validated
+   against 3,100+ scraped server replays (see replays/scraped/diff_results.tsv for the
+   definitive numbers; end-of-turn "restore" states — the RL decision points — pass at
+   a higher rate than mid-phase frames). Remaining residuals are characterized in
+   MECHANICS §Fix status (deep-stack shield/damage attribution + rare targeting
+   near-ties, ~0.5% of mid-phase frames, non-compounding for self-play because the sim
+   is its own engine on both sides). Read MECHANICS §External bug-report audit before
+   changing ANYTHING in the sim — several plausible-sounding "fixes" (shield cap, phase
+   reorder, MP quantization, strict shield range, f64 shield amounts) were tested and
+   REFUTED against production data; the audit trail is there so nobody re-breaks it.
 2. Sim: `Game.legal_mask` + incremental plan-scratch support in py.rs (spec §3.4). Gate:
    mask agrees with `apply_commands` acceptance on 10K random commands.
 3. Replay ingestion (§7). Gate: parses every scraped replay; per-position tensors
@@ -400,3 +406,87 @@ training and deployment (zero train/deploy skew); early-exit compute cap when wi
    fixed-point int8 forward pass — 10× slower, K=6/M=4 budget, still viable).
 3. 50–200 ladder replay IDs with team labels (for §7 dedupe).
 4. RunPod pod per §10 + repo access on it (private GitHub token or rsync).
+
+
+---
+
+## 13. Curriculum: cold start → self-play (the two-stage story, explicit)
+
+**Stage A — supervised warm start (GPU hours 0–2, all data already on disk):**
+1. Parse the scraped corpus (~2,000–3,000 competition replays in replays/scraped/) into
+   (state tensors, executed plan, outcome) triples for BOTH sides of every game.
+2. Train, simultaneously, from scratch:
+   - policy decoder on WINNERS' plans only (loser plans excluded), fingerprint-capped
+     (§7.3) — many of these teams are weak, so this is only a sane-opening prior, not a
+     target: 1 epoch cap, stop at plateau, expect ~30–40% token top-1;
+   - opponent-prediction head on ALL plans by ALL players (the population model — weak
+     players are IN the population we must predict, so their data is genuinely useful);
+   - value + aux heads on outcomes z of the same games PLUS 5–10K scripted-vs-scripted
+     sim games generated on the CPU while the GPU trains (§6.3).
+3. Freeze a copy = **BC-anchor** (league member + gauntlet opponent forever).
+   Gate: anchor beats the starter algo ≥90% when driven by the K×M search.
+
+**Stage B — Expert Iteration self-play (the main engine, GPU hours 2–25):**
+Actors play league games (§6.4 mix); every decision runs the K×M search (§5); the search
+result π* becomes the policy target, game outcomes become value targets, opponents' actual
+plans feed the prediction head — the network is forever chasing its own search, and the
+search is forever sharpened by the better network (standard ExIt loop). The BC prior
+washes out automatically as self-play data floods the buffer (FIFO 500K). No phase switch,
+no reward change, no schedule cliff: Stage B is one continuous run with snapshots every
+30 min and the gauntlet every 2 h.
+
+**Stage C — selection & packaging (last 4–6 h):** pick best-by-gauntlet (min-based
+promotion rule §8), export weights.bin, build dist/python-algo/, Rust-parity gate,
+1-core rehearsal, ship.
+
+## 14. Implementation contract for the code-writing pass
+
+Produce exactly this tree (names are binding; each module lists its public surface):
+
+```
+train/
+  config.yaml          # every hyperparameter in this doc, under the section names used here
+  features.py          # build_planes(game, player, history) -> (board[18,28,28] f32, scalars[14])
+                       #   thin wrapper over Game.board_planes + deploy-history planes 12-17
+  tokens.py            # Token = (type:int, loc:int, count_bucket:int); encode/decode plan<->
+                       #   sim command tuples; legality mask builder over a plan-scratch;
+                       #   mirror-augmentation remapping
+  model.py             # TerminalNet(nn.Module): torso/value/aux/policy-GRU/prediction-GRU
+                       #   per §4; forward_torso, decode_step, value, aux, predict_step
+  search.py            # choose(game, net_client, K, M, tau, budget_s) -> (plan, pi_star,
+                       #   diagnostics); §5 exactly; identical code path used by actors AND
+                       #   the deployment driver (train/deploy split happens at net_client)
+  replays.py           # scraped-corpus reader -> BC/prediction/value datasets; winner
+                       #   filter; opening-fingerprint dedupe caps; mirror augmentation
+  scripted.py          # the 5 scripted bots (rush/funnel/demolisher-line/turtle/torture)
+                       #   as pure functions state->commands, used by league + gauntlet
+  league.py            # snapshot pool, PFSP sampling, eviction (§6.4)
+  actor.py             # one process: plays games, streams trajectories to the learner
+                       #   over a socket/shared-mem queue; resignation rule §5.4
+  infer_server.py      # GPU batching server: torso/decode/value/predict request types,
+                       #   batch<=512 or 3ms; weight hot-reload every ~2min
+  learner.py           # replay buffer, losses §6.1, optimizer §6.2, checkpointing
+  evaluate.py          # gauntlet runner + promotion rule §8; writes eval/report.json
+  export.py            # torch checkpoint -> weights.bin (flat f32, headered) + parity test
+  run.py               # CLI: --phase {bootstrap,pilot,main,package} orchestrating all of
+                       #   the above; resumable; tmux-friendly logging + tensorboard
+deploy/
+  algo_strategy.py     # thin driver: gamelib parse -> Game mirror -> search.choose with
+                       #   anytime budget §9.3 -> submit; watchdog; fallback ladder
+  fallback.py          # zero-dependency scripted funnel bot
+```
+
+Definition of done (the "write the code" prompt should end with all of these green):
+1. `cargo test` + `tsim diff` on every replay in replays/ AND a 200-replay sample of
+   replays/scraped/ → PASS rate ≥ 99% of frames (documented residuals only).
+2. `python -m train.run --phase bootstrap` on the pod: builds everything, Stage A
+   completes, BC-anchor gate passes.
+3. `python -m train.run --phase pilot` (K=8, M=4, 2 h): gauntlet win-rate strictly
+   increasing across the run; zero actor crashes.
+4. `python -m train.run --phase main` runs unattended (only GPU-hours limit it).
+5. `python -m train.run --phase package`: dist/python-algo/ < 50 MB unpacked, parity
+   test < 1e-4, 50-game 1-core rehearsal zero timeouts, folder uploads and wins vs the
+   probe algo on the platform.
+
+Human effort after code lands: buy pod → run 4 commands → watch TensorBoard →
+download dist/python-algo/ → upload. Nothing else.

@@ -164,9 +164,9 @@ impl Config {
                     // don't override getHitRadius this season).
                     attack_d2[a][up][t] = d2_threshold(st.attack_range, units[t][0].hit_radius);
                 }
-                // shields & self-destructs target mobile/enemy units; use scout radius class:
-                // all mobiles share per-kind radii, so compute per target kind at use site is
-                // unnecessary — every mobile radius gives identical integer thresholds.
+                // shields include the exact-distance boundary (dist <= range + hit):
+                // upgraded support range 7.0 DOES grant at d2 = 49 — confirmed by the
+                // previously-exact corpus regressing under a strict-< experiment.
                 shield_d2[a][up] = d2_threshold(st.shield_range, units[SCOUT as usize][0].hit_radius);
                 sd_d2[a][up] = d2_threshold(st.sd_range, units[SCOUT as usize][0].hit_radius);
             }
@@ -249,7 +249,7 @@ mod tests {
         assert_eq!(c.attack_d2[DEMOLISHER as usize][0][TURRET as usize], 20); // 4.5
         assert_eq!(c.sd_d2[SCOUT as usize][0], 2); // 1.5 -> 2.34
         assert_eq!(c.shield_d2[SUPPORT as usize][0], 6); // 2.5 -> 6.40
-        assert_eq!(c.shield_d2[SUPPORT as usize][1], 49); // 7.0 -> 49.42
+        assert_eq!(c.shield_d2[SUPPORT as usize][1], 49); // 7.0 -> 49.42 (49 included!)
     }
 
     #[test]

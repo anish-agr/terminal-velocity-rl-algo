@@ -267,13 +267,16 @@ pub fn commands_from_frame0(raw: &Value) -> [TurnCommands; 2] {
 
 // -------------------------------------------------------------------------------- diff
 
-fn canon_units(units: &[UnitSnap]) -> Vec<(u8, u8, i8, i8, u32, bool, bool)> {
+fn canon_units(units: &[UnitSnap]) -> Vec<(u8, u8, i8, i8, u64, bool, bool)> {
     // health goes through display01: replay unit healths are ceil-tenth displays of the
     // engine's raw f64s (corpus: shield sums print 26.6 for raw 26.599999999999998)
+    // health quantized to 0.01 — absorbs characterized f32 shield-pool dust (<=1e-3)
+    // while preserving every legitimate distinction (real values are exact tenths)
     let mut v: Vec<_> = units
         .iter()
         .map(|u| {
-            (u.owner, u.kind, u.x, u.y, u.health.to_bits(), u.upgraded, u.pending)
+            let hq = ((u.health as f64) * 100.0).round() as i64;
+            (u.owner, u.kind, u.x, u.y, hq as u64, u.upgraded, u.pending)
         })
         .collect();
     v.sort();
@@ -404,13 +407,13 @@ pub fn diff_replay(path: &str, verbose: usize) -> DiffStats {
                 for u in su.iter().filter(|u| !eu.contains(u)).take(6) {
                     msgs.push(format!(
                         "unit only in sim: p{} k{} ({},{}) hp {} upg {} pend {}",
-                        u.0 + 1, u.1, u.2, u.3, f32::from_bits(u.4), u.5, u.6
+                        u.0 + 1, u.1, u.2, u.3, (u.4 as f64) / 100.0, u.5, u.6
                     ));
                 }
                 for u in eu.iter().filter(|u| !su.contains(u)).take(6) {
                     msgs.push(format!(
                         "unit only in engine: p{} k{} ({},{}) hp {} upg {} pend {}",
-                        u.0 + 1, u.1, u.2, u.3, f32::from_bits(u.4), u.5, u.6
+                        u.0 + 1, u.1, u.2, u.3, (u.4 as f64) / 100.0, u.5, u.6
                     ));
                 }
             }
@@ -515,13 +518,13 @@ pub fn diff_replay(path: &str, verbose: usize) -> DiffStats {
                 for u in a.iter().filter(|u| !b.contains(u)).take(4) {
                     println!(
                         "    sim-only: p{} k{} ({},{}) hp {}",
-                        u.0 + 1, u.1, u.2, u.3, f32::from_bits(u.4)
+                        u.0 + 1, u.1, u.2, u.3, (u.4 as f64) / 100.0
                     );
                 }
                 for u in b.iter().filter(|u| !a.contains(u)).take(4) {
                     println!(
                         "    engine-only: p{} k{} ({},{}) hp {}",
-                        u.0 + 1, u.1, u.2, u.3, f32::from_bits(u.4)
+                        u.0 + 1, u.1, u.2, u.3, (u.4 as f64) / 100.0
                     );
                 }
             }

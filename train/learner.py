@@ -394,6 +394,25 @@ def run_learner(
     weights_path = os.path.join(run_dir, "weights_current.pt")
     reload_s = float(cfg["actors"]["weight_reload_s"])
     snap_s = float(cfg["league"]["snapshot_interval_min"]) * 60.0
+    ckpt_path = os.path.join(run_dir, "checkpoint.pt")
+    ckpt_s = float(cfg["schedule"]["checkpoint_min"]) * 60.0
+
+    # Resume (run.py's phase contract: pilot/main CONTINUE from run_dir). A
+    # fresh Learner here is a random-init net — without this reload its first
+    # export would overwrite the bootstrap/pilot weights_current.pt, and its
+    # empty League would rewrite league.json (anchor flag, snapshot pool, id
+    # counter) on the first loop pass.
+    if os.path.exists(ckpt_path):
+        learner.load_checkpoint(ckpt_path)
+        print("learner: resumed {} at step {}".format(
+            ckpt_path, learner.step_count), flush=True)
+    elif os.path.exists(weights_path):
+        learner.net.load_state_dict(
+            learner.torch.load(weights_path, map_location="cpu"))
+        print("learner: warm-started net from {}".format(weights_path),
+              flush=True)
+    if os.path.exists(league_path):
+        learner.league.load(league_path)
 
     writer = None
     try:
@@ -402,7 +421,7 @@ def run_learner(
     except Exception as exc:
         print("tensorboard writer disabled: {!r}".format(exc), flush=True)
 
-    last_reload = last_snap = time.time()
+    last_reload = last_snap = last_ckpt = time.time()
     steps_owed = 0.0
     recent = deque(maxlen=200)   # (opponent_kind, current_won) rolling window
     games = 0
@@ -467,7 +486,19 @@ def run_learner(
                 control_q.put(("load_model", snap_id, snap_path))
                 learner.league.save(league_path)
                 last_snap = now
+            if now - last_ckpt >= ckpt_s and learner.step_count > 0:
+                learner.save_checkpoint(ckpt_path)
+                last_ckpt = now
             learner.league.save(league_path)
     finally:
+        # Phase end (deadline / Ctrl-C / crash): persist net+opt+step and the
+        # league so the next phase resumes exactly here. Writes are atomic
+        # (tmp + os.replace) — a second interrupt leaves the old files intact.
+        try:
+            if learner.step_count > 0:
+                learner.save_checkpoint(ckpt_path)
+                learner.league.save(league_path)
+        except Exception as exc:
+            print("final checkpoint save failed: {!r}".format(exc), flush=True)
         if writer:
             writer.close()

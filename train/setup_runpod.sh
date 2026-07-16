@@ -28,7 +28,7 @@ pip install -q maturin
 pip install -q --force-reinstall sim/target/wheels/terminal_sim-*.whl
 
 echo "== python deps =="
-pip install -q numpy tensorboard
+pip install -q numpy tensorboard pyyaml
 
 echo "== fidelity gate: sim must be frame-exact vs engine.jar replays =="
 FAIL=0

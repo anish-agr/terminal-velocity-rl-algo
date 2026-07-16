@@ -1,0 +1,128 @@
+# Training configuration — single source of truth for every hyperparameter in
+# train/ARCHITECTURE.md. Section keys mirror the doc's section numbers so each value
+# can be traced to its specification. Values marked (tunable) in the doc are flagged.
+
+state:                       # ARCHITECTURE §2
+  board_planes: 18           # 0-11 from sim bridge, 12-17 deploy-history (python-side)
+  scalars: 14
+  deploy_count_norm: 10.0    # planes 12-14: count/10, clamp 1
+  deploy_ema_decay: 0.7      # planes 15-17: per-turn EMA decay
+  mirror_augment: true       # §2.3 x-mirror duplication at sample time
+  scalar_norm:               # §2.2 divisors, in order
+    hp: 30.0
+    sp: 40.0
+    mp: 15.0
+    turn: 100.0
+    mp_income: 10.0
+    breach: 5.0
+    structure_damage: 50.0
+
+action:                      # ARCHITECTURE §3
+  t_max: 24                  # max tokens per plan (incl. END)
+  n_token_types: 9           # 3 builds, upgrade, remove, 3 deploys, END
+  count_buckets: [1, 2, 3, 5, 8, 13, 21, -1]   # -1 == ALL (spend-remaining)
+  affordability_margin: 0.1  # §3.2 / MECHANICS Open-fix 3: never depend on last 0.1
+  null_deploy_mask: true     # §3.3 provably-null masking (tunable: OFF for ablation)
+  null_deploy_min_steps: 5   # SD with < 5 steps deals no damage -> pure MP burn
+
+network:                     # ARCHITECTURE §4
+  channels: 64
+  res_blocks: 6
+  scalar_mlp: [64, 64]       # 14 -> 64 -> 64, added FiLM-lite to channels 0-63
+  gru_hidden: 128
+  type_emb: 16
+  count_emb: 16
+  pointer_qk: 64             # W_q: 128->64; W_k: 1x1 conv 64->64
+  value_fc: 256
+  aux_fc: 128
+  aux_outputs: 3             # Δhp/10, Δnet-worth/50, Δresources/20 at t+3
+  aux_horizon: 3             # turns ahead for aux targets
+  aux_norm: [10.0, 50.0, 20.0]
+
+search:                      # ARCHITECTURE §5
+  k_train: 12                # own-plan samples (+greedy +all-defense, deduped)
+  k_deploy: 16
+  m_train: 6                 # opponent samples (+literal-previous +empty)
+  m_deploy: 8
+  tau_act_start: 1.0         # actor sampling temperature, linear anneal ->
+  tau_act_end: 0.7
+  tau_deploy: 0.5
+  tau_opponent: 1.0
+  tau_target: 0.25           # §5.3 expert softmax temperature
+  lambda_security: 0.7       # §5.2 expected-case weight; 1-λ on min_j (tunable)
+  opponent_weight_temp: 0.5  # w_j ∝ p_j^0.5
+  early_exit_v: 0.98         # §5.4 skip widening when winning
+  resign_v: -0.97            # §5.4
+  resign_consecutive: 3
+  resign_exempt_frac: 0.10   # value-blind-spot insurance
+
+learning:                    # ARCHITECTURE §6
+  lr: 3.0e-4
+  lr_end: 3.0e-5             # cosine decay target over planned run
+  weight_decay: 1.0e-4
+  batch_size: 1024
+  total_steps: 50000         # cosine/anneal horizon (the "planned run length")
+  micro_batch_sequences: 2048  # NLL chunk size: B x K_eff feature maps at once OOMs
+  policy_through_torso: true   # policy/predict grads shape the torso (flip off only on OOM)
+  grad_clip: 1.0
+  buffer_capacity: 500000    # FIFO positions
+  buffer_min_fill: 20000
+  steps_per_1k_positions: 4  # learner:actor ratio (tunable)
+  loss_weights:
+    value: 1.0
+    aux_start: 0.5           # §6.3: first 25% of run
+    aux_end: 0.1             # linear -> by 50%, then fixed
+    predict: 0.5
+  entropy_coef: 1.0e-3       # decays to 0 by mid-run
+  entropy_end_frac: 0.5      # fraction of run at which entropy bonus reaches 0
+
+league:                      # ARCHITECTURE §6.4
+  p_current: 0.35
+  p_snapshot: 0.40           # PFSP f(w) = w*(1-w) over rolling win-rate
+  p_scripted: 0.15
+  p_bc_anchor: 0.10
+  snapshot_interval_min: 30
+  snapshot_pool_max: 20
+  evict_winrate: 0.9         # evict when w > 0.9 for evict_hours
+  evict_hours: 2.0
+  pfsp_winrate_window: 50    # rolling games per snapshot for w estimate
+
+replays:                     # ARCHITECTURE §7
+  api_url: "https://terminal.c1games.com/api/game/replayexpanded/{}"
+  rate_limit_s: 1.0
+  bc_fingerprint_turns: 4    # turn 0-3 build-sequence hash
+  bc_fingerprint_cap: 0.25   # max fraction of BC dataset per fingerprint
+  bc_epochs_max: 1           # §13 Stage A: 1 epoch cap, stop at plateau
+  scraped_dir: "replays/scraped"
+
+evaluation:                  # ARCHITECTURE §8
+  gauntlet_games: 200        # 100 as P1, 100 as P2
+  promote_vs_best: 0.55
+  promote_vs_scripted: 0.85  # vs EVERY scripted bot (min-based)
+  promote_max_crashes: 0
+
+actors:                      # ARCHITECTURE §5.5
+  per_vcpu: 2
+  infer_batch_max: 512
+  infer_batch_wait_ms: 3.0
+  weight_reload_s: 120
+  seeded_start_frac: 0.15    # §11 position-seeded self-play (P2 phase only)
+
+cold_start:                  # ARCHITECTURE §6.3 / §13 Stage A
+  scripted_seed_games: 7500  # 5-10K scripted/random-vs-scripted sim games
+  bc_gate_vs_starter: 0.90   # anchor (with search) must beat starter >= 90%
+
+deployment:                  # ARCHITECTURE §9
+  soft_budget_s: 2.5         # p99 target
+  watchdog_submit_s: 4.0
+  k_start: 8                 # anytime ladder: double K then M while < soft budget
+  m_start: 4
+  weights_file: "weights.bin"
+  parity_tol: 1.0e-4
+  max_folder_mb: 50
+  rehearsal_games: 50
+
+schedule:                    # ARCHITECTURE §10
+  planned_run_hours: 20      # lr/entropy/tau schedules anneal over this horizon
+  checkpoint_min: 10         # to network volume
+  gauntlet_every_h: 2.0

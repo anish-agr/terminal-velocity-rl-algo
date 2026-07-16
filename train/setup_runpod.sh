@@ -30,6 +30,16 @@ pip install -q --force-reinstall sim/target/wheels/terminal_sim-*.whl
 echo "== python deps =="
 pip install -q numpy tensorboard pyyaml
 
+# CRITICAL: `cargo build --features python` (which the maturin step above runs
+# internally) rebuilds the WHOLE package under that feature, including the `tsim` CLI
+# binary — pyo3's extension-module ABI makes that binary silently non-functional when
+# run standalone (exits 0, prints nothing; verified 2026-07-16, cost a wasted
+# 3,103-replay validation run before being caught). Rebuild the plain, feature-free
+# binary again here so the fidelity gate below tests the actual deployed sim, not a
+# python-linked one.
+echo "== rebuild plain CLI binary (undo any python-feature contamination) =="
+cargo build --manifest-path sim/Cargo.toml --release
+
 echo "== fidelity gate: sim must be frame-exact vs engine.jar replays =="
 FAIL=0
 for r in replays/*.replay; do

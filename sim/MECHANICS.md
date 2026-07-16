@@ -8,7 +8,100 @@ Two gaps surfaced by server replays, both characterized (see §Open fixes). Veri
 tool: `sim/target/release/tsim diff <replay>`. Re-run on every sim change and every new
 replay.
 
-## Fix status (2026-07-16)
+## Fix status (2026-07-16, round 3 — full corpus revalidation, 3,847 replays)
+
+Full re-validation via `scripts/batch_diff.sh` against `replays/scraped/*.replay` (all
+3,847 files, using the corrected `tsim.exe` — see below for the corrupted-binary incident
+this superseded): **3,489/3,847 full-replay PASS (90.7%), frame-exact 3,446,733/3,451,316
+(99.8672%)**.
+
+**Corrupted-binary incident (caught before being reported as fact):** an intervening
+`cargo build --release --features python` (run to refresh `terminal_sim.pyd`) silently
+rebuilt the standalone `tsim` CLI binary under PyO3's `extension-module` ABI too — Cargo
+applies `--features` package-wide by default, and that ABI makes the CLI binary exit 0 with
+zero output when run outside a Python host process. A batch run against that broken binary
+produced a nonsensical "243/3103 PASS, 99.9967% frame-exact" result (internally
+inconsistent — frame count crashed to ~241K from an expected ~3.86M, several worst-10
+entries were literal all-zero rows, a crash signature). Fixed by rebuilding the plain
+feature-free binary (`cargo build --release`, no features) before any fidelity gate, and
+the same ordering hazard was fixed in `train/setup_runpod.sh` (which built the python wheel
+*before* its fidelity gate — would have failed the gate on every pod run). Repo-wide grep
+confirmed no other script has this hazard.
+
+**Root cause of the dominant remaining divergence category (diagnosed, NOT a sim bug):**
+triaged the worst-10 replays by frame-mismatch count (594, 256, 182, 178, 153, 150, 110, 77,
+77, 77 — a handful of replays account for a disproportionate share of the corpus's frame
+mismatches because one divergence cascades forward for the rest of that replay). Every one
+of the 5 checked has the identical signature: the FIRST divergence is a small (1-3 point)
+player-HP mismatch at a turn-boundary frame, with **zero** breach/damage/selfDestruct event
+anywhere in that frame's event log, and no enemy mobile unit anywhere near the breaching
+edge. Confirmed by exhaustively scanning one full replay (15330159) for every breach event
+of either owner across the whole game: player 1's HP always drops in perfect lock-step with
+a logged owner=2 breach event in the same frame (correct, expected) — but player 2's HP
+drops twice (turn 26, turn 30) with **no owner=1 breach event anywhere in the entire
+replay**. Replay frames carry no compute-time metadata at all.
+
+This matches the competition's own turn-timer rule (5s soft limit, **1 HP/sec penalty for
+time over the limit**, 35s = skipped turn) — a real bot on the ladder occasionally thinking
+too long and eating an HP penalty that is a pure server-side artifact of that bot's
+wall-clock compute time, invisible in the replay JSON. A rules-only simulator cannot
+reconstruct this from replay data under any circumstances — it isn't a state-transition bug,
+it's missing input. **Do not chase this further** — it inflates the "divergent replay" count
+without reflecting any real engine inaccuracy. True engine fidelity (excluding
+compute-time-penalty replays) is materially higher than the raw 90.7%/99.87% headline
+numbers. If a specific replay needs to be confirmed as a timeout case vs. a real bug, look
+for the same signature (isolated small HP delta, zero causal event, no enemy unit near the
+edge) before assuming it's fixable.
+
+## Fix status (2026-07-16, round 2 — externally reported drift bugs)
+
+Four externally-reported "critical drift bugs" were verified against fresh replay evidence
+before touching anything (per the audit-first policy below). Two were real; the sim's
+overall fidelity on a fixed 443-replay sample (deterministic subset, every 7th scraped
+replay by ID) moved from **99.13% -> 99.93% frame-exact** and **98.61% -> 99.73%
+restore-exact** as a direct result — a ~13x and ~5x reduction in residual error rate,
+respectively, with zero regression on any metric. Full 3,103-replay corpus re-run in
+progress; see `replays/scraped/diff_results.tsv` for the latest numbers.
+
+1. **CONFIRMED — SP refund quantized PER STRUCTURE to the nearest tenth, round-half-up,
+   before being summed/credited.** Root-caused against `scraped/15327732.replay` turn 16
+   (P2 removes 4 walls + 2 upgraded walls): raw refund sum = 5.146667, engine-observed
+   refund = 5.100000. Then validated at scale: scanned every scraped replay for turns
+   where a player's ONLY frame0 commands were REMOVEs (isolates the SP delta cleanly),
+   found 229 such turns across 400 replays, and checked the observed SP delta against
+   raw-sum / floor-sum / round-sum / ceil-sum of the individually-computed refunds (using
+   each structure's health at the END of that turn's action phase, matching our
+   restore-time execute_removals). Result: **round-sum matches 229/229; raw only 184/229;
+   floor 206/229; ceil 199/229.** Fix applied in `state.rs::execute_removals`:
+   `refund = (raw*10.0 + 0.5).floor() / 10.0` per structure, summed after.
+2. **CONFIRMED — upgrading a structure assigns it a NEW engine id, and that id becomes its
+   new attack-order tie-break seq.** Root-caused against the same replay, turn 8: a wall
+   built at (22,15) gets id 143; upgrading it the same turn logs a SEPARATE spawn event,
+   id 158, same tile. Our sim already advanced the global id counter on upgrade (so
+   replay-mode id matching was fine) but never wrote the new id back onto the structure's
+   own `seq` field — which is what attack ordering actually sorts by. Almost certainly the
+   dominant contributor to the "rare targeting near-ties" residual documented below. Fix:
+   `state.rs::apply_one` (Upgrade arm) now sets `s.id = id; s.seq = id;` from the same
+   `take_id()` call already in use.
+3. **REFUTED — "build over an existing structure."** Claimed evidence: P1 builds at
+   (0,13)/(1,13)/(2,13) on turn 24 of `15327732.replay`, tiles that held a wall+2 turrets
+   at turn 23. Traced directly: those three structures show ordinary COMBAT deaths
+   (`removal_flag=False`) at turn 23 frame 26 — destroyed by enemy fire, not replaced.
+   By turn 24's deploy the tiles are already empty; these are unremarkable builds onto
+   empty ground, which the engine already handles correctly (Deaths step clears the grid
+   entry same-frame). No such mechanic exists; it would also contradict the rules text
+   ("no two Structures can occupy the same location"). `Cmd::Build`'s occupancy check is
+   unchanged.
+4. **REFUTED as a distinct bug — `upgrade_cost_sp` JSON fallback.** Claimed the config
+   parser falls back to 0.0 for a missing `upgrade.cost1`, producing a 0.4 SP variance at
+   turn 21 of the same replay. The parser already falls back to the BASE unit's cost (not
+   0.0) — `unwrap_or(base_cost_sp)` — independently verified correct earlier via turn-0 SP
+   accounting (season config: wall upgrade omits cost1, engine charges 1 SP = base cost).
+   The claimed 0.4 SP variance is fully explained by bug #1 above (unrounded refund sum);
+   a single upgraded-wall refund's raw-vs-rounded gap is easily that large. config.rs
+   unchanged.
+
+## Fix status (2026-07-16, round 1)
 
 APPLIED & validated: (1) SD AoE hits <=0-health units — ladder replays now frame-exact;
 (2) action phase ends immediately when a player reaches 0 HP mid-phase (engine stops

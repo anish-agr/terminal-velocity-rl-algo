@@ -111,7 +111,34 @@ class AlgoStrategy(gamelib.AlgoCore):
                 self.fallback.apply(game_state)
             except Exception:
                 pass
+        # exactly one log entry per turn frame, recording what gamelib ACTUALLY
+        # staged (fallback turns included, and net of gamelib's own filtering).
+        # Logging [] here instead would leave every future mirror rebuild
+        # missing this turn's builds -> _mirror_in_sync fails -> permanent
+        # fallback lock-in after a single watchdog miss.
+        if self.mode == "search" and len(self.our_log) < len(self.turn_frames):
+            self.our_log.append(self._staged_cmds(game_state))
         game_state.submit_turn()
+
+    def _staged_cmds(self, game_state):
+        """gamelib's per-turn stacks -> engine (kind, x, y) command tuples.
+        unitInformation index IS the engine kind (0-5 units, 6 remove, 7
+        upgrade), so the shorthand map covers every stack entry."""
+        try:
+            short2kind = {
+                info["shorthand"]: k
+                for k, info in enumerate(self.config["unitInformation"])
+                if "shorthand" in info
+            }
+            out = []
+            for (sh, x, y) in list(game_state._build_stack) + \
+                    list(game_state._deploy_stack):
+                kind = short2kind.get(sh)
+                if kind is not None:
+                    out.append((int(kind), int(x), int(y)))
+            return out
+        except Exception:
+            return []
 
     # ------------------------------------------------------------------
     def _search_turn(self, game_state, turn_state):
@@ -141,8 +168,7 @@ class AlgoStrategy(gamelib.AlgoCore):
         if mirror is None or not self._mirror_in_sync(mirror, frame):
             gamelib.debug_write("TV: mirror out of sync turn {}".format(turn))
             self.fallback.apply(game_state)
-            self.our_log.append([])   # we know exactly what fallback staged is
-            return                    # approximate; resync from server next turn
+            return   # on_turn logs the staged commands for this turn
 
         # search in a worker; watchdog submits the fallback plan on a miss
         result = {}
@@ -169,14 +195,14 @@ class AlgoStrategy(gamelib.AlgoCore):
             gamelib.debug_write("TV: watchdog ({})".format(
                 result.get("error", "deadline")))
             self.fallback.apply(game_state)
-            self.our_log.append([])
-            return
+            return   # on_turn logs the staged commands for this turn
 
         spec = ScratchSpec(self.costs, mirror.structures(),
                            mirror.stats(0)[1], mirror.stats(0)[2], False, 0)
         cmds = encode_plan(list(result["plan"]), spec())
         self._stage(game_state, cmds)
-        self.our_log.append(cmds)
+        # on_turn records the staged stacks (what the server will actually
+        # get) rather than `cmds` — gamelib may have filtered some attempts
 
     # ------------------------------------------------------------------
     def _stage(self, game_state, cmds):

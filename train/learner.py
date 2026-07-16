@@ -50,8 +50,12 @@ def plan_masks(
 
     Returns (type[T,9], loc[T,784], count[T,8], length). Steps beyond the plan
     are all-True padding (gated off by length in plan_nll). A token illegal
-    under the rebuilt scratch (possible for opponent plans that the engine
-    truncated) ends the sequence at that step.
+    under the rebuilt scratch (possible for opponent plans whose executed spend
+    the 0.1 affordability margin rejects) ends the sequence at that step —
+    length counts only the LEGAL prefix and is 0 when the very first token is
+    illegal. Callers must gate such rows out (lengths=0 makes plan_nll emit
+    exactly 0 for the row); feeding the illegal token itself would gather a
+    -1e9-masked logit and poison the loss.
     """
     tm = np.ones((t_max, N_TYPES), dtype=bool)
     lm = np.ones((t_max, N_LOCS), dtype=bool)
@@ -71,7 +75,7 @@ def plan_masks(
             break
         scratch.apply(tok)
         length += 1
-    return tm, lm, cm, max(length, 1)
+    return tm, lm, cm, length
 
 
 def _mirror_structures(structures):
@@ -264,6 +268,9 @@ class Learner:
                 tm[i] = torch.from_numpy(tmk)
                 lm[i] = torch.from_numpy(lmk)
                 cm[i] = torch.from_numpy(cmk)
+                # length 0 = plan illegal from token 0 under the rebuilt
+                # scratch; lengths=0 makes plan_nll contribute exactly 0 for
+                # this row (never gather the -1e9-masked illegal token)
                 lengths[i] = length
                 for t, tok in enumerate(plan[:length]):
                     plans_t[i, t, 0] = tok.type
@@ -363,10 +370,18 @@ def run_learner(
     device: str = "cpu",
     max_steps: Optional[int] = None,
     steps_per_1k: Optional[float] = None,
+    deadline_ts: Optional[float] = None,
 ) -> None:
     """Consume trajectories, keep the learner:actor ratio (§6.2), snapshot the
     league every snapshot_interval_min, export weights for hot reload. Sends
-    ("weights", path) messages on control_q for the inference server."""
+    ("weights", path) messages on control_q for the inference server.
+
+    deadline_ts: absolute time.time() to stop at (the phase's `hours` budget —
+    the pilot phase MUST self-terminate so its gate can be read on schedule).
+    Also prints rolling win-rates per opponent kind every 50 games: this is the
+    §8 pilot-gate signal ("win-rate rising hour-over-hour") — without it a run
+    exposes no strength trend at all, since the full gauntlet never runs
+    in-loop."""
     learner = Learner(cfg, config, device=device)
     ratio = steps_per_1k if steps_per_1k is not None else \
         float(cfg["learning"]["steps_per_1k_positions"])
@@ -377,14 +392,29 @@ def run_learner(
 
     last_reload = last_snap = time.time()
     steps_owed = 0.0
+    recent = deque(maxlen=200)   # (opponent_kind, current_won) rolling window
+    games = 0
 
-    while max_steps is None or learner.step_count < max_steps:
+    while (max_steps is None or learner.step_count < max_steps) and \
+            (deadline_ts is None or time.time() < deadline_ts):
         try:
             meta, positions = trajectory_q.get(timeout=1.0)
         except Exception:
             continue
         learner.ingest(meta, positions)
         steps_owed += ratio * len(positions) / 1000.0
+
+        winner, me = meta.get("winner", -1), meta.get("me")
+        if winner >= 0 and me is not None:
+            recent.append((meta.get("opponent_kind", "?"), winner == me))
+        games += 1
+        if games % 50 == 0 and recent:
+            by: Dict[str, List[bool]] = {}
+            for kind, won in recent:
+                by.setdefault(kind, []).append(won)
+            print("winrate[last {}] ".format(len(recent)) + "  ".join(
+                "{}: {:.0%} ({})".format(k, sum(v) / len(v), len(v))
+                for k, v in sorted(by.items())), flush=True)
 
         while steps_owed >= 1.0:
             metrics = learner.train_step()

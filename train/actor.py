@@ -277,11 +277,20 @@ def run_actor(
             record = (me,)
 
         tau = tau_fn(played) if tau_fn else float(cfg["search"]["tau_act_start"])
-        meta, positions = play_game(
-            game_factory, clients, scripted, record, cfg, config, costs, rng,
-            k=int(cfg["search"]["k_train"]), m=int(cfg["search"]["m_train"]),
-            tau=tau,
-        )
+        try:
+            meta, positions = play_game(
+                game_factory, clients, scripted, record, cfg, config, costs,
+                rng, k=int(cfg["search"]["k_train"]),
+                m=int(cfg["search"]["m_train"]), tau=tau,
+            )
+        except Exception as exc:
+            # a transient failure (server hiccup, unknown snapshot model, one
+            # bad state) must cost ONE game, not this actor for the whole run
+            print("actor {} game vs {}:{} failed: {!r}".format(
+                actor_id, kind, detail, exc), flush=True)
+            time.sleep(5.0)
+            played += 1
+            continue
         meta.update({
             "actor": actor_id, "opponent_kind": kind, "opponent": detail,
             "me": me, "t_done": time.time(),

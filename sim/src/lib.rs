@@ -7,6 +7,7 @@ pub mod state;
 pub mod path;
 pub mod engine;
 pub mod replay;
+pub mod nn;
 
 #[cfg(feature = "python")]
 pub mod py;

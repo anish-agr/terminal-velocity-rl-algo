@@ -21,3 +21,9 @@
 *.whl binary
 scripts/test_algo_* binary
 
+# Fidelity-gate corpus: the pod's setup_runpod.sh gate must diff replays that
+# are BYTE-IDENTICAL to the ones validated locally. Some carry CRLF line
+# endings; both parsers (replay.rs, replay_utils.py) handle either, but the
+# gate inputs must never be rewritten in transit.
+*.replay -text
+

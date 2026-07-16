@@ -8,7 +8,45 @@ Two gaps surfaced by server replays, both characterized (see §Open fixes). Veri
 tool: `sim/target/release/tsim diff <replay>`. Re-run on every sim change and every new
 replay.
 
-## Open fixes (root-caused, exact fix logic specified — implement in this order)
+## Fix status (2026-07-16)
+
+APPLIED & validated: (1) SD AoE hits <=0-health units — ladder replays now frame-exact;
+(2) action phase ends immediately when a player reaches 0 HP mid-phase (engine stops
+emitting frames — ladder-15330187 turn 27); (3) replay harness force-applies
+engine-accepted commands past affordability (bounded MP drift, §3 below) and screams
+"GEOMETRY GAP" if a forced command is structurally impossible (= real bug); (4) unit
+health comparison quantized to 0.01 (absorbs shield-pool f32 dust <=1e-3).
+CONFIRMED-CORRECT after a false fix attempt: shield grant amount is the PURE f32 chain
+`shieldPerUnit + shieldBonusPerY * own_y` (local engine grants print "6.7" = exactly what
+the f32 chain yields; widening through the f32-stored config to f64 lands one ulp HIGH —
+reverted; see engine.rs comment).
+
+KNOWN RESIDUALS (characterized, deliberately not chased):
+- platform-probe-match turns 44 & 55 (3 frames of 4,114): rare attacker/target
+  disagreement under near-ties (two turrets, equal-range equal-health targets) —
+  reproduction pointers preserved in that replay; revisit only if scaled validation shows
+  the pattern is common.
+- SHIELD ATTRIBUTION in deep stacks (scraped/15327711 turn 15 frame 26): with ~18 scouts
+  stacked, TWO units ended the phase missing exactly two specific supports' grants
+  (6.4 + 4.6 = the observed 11.0 hp delta) in the engine while our sim granted uniformly;
+  event multisets match (grants differ only in receiving unit ID). Hypothesis space:
+  engine's once-per-pair bookkeeping interacts with unit iteration order when stacks
+  split. NOTE: a strict dist<range shield-boundary experiment (excluding d2=49 for range
+  7.0) was tested and REFUTED — it regressed the previously-exact corpus; inclusive
+  d2<=49 is correct. Frequency quantified by the corpus batch run (diff_results.tsv).
+- resource micro-drift on long banking chains (§Open fix 3 below) — bounded < 0.1,
+  mitigations in place, mathematically shown unresolvable from replay data alone.
+- REFUND of marked-then-destroyed structures (scraped/15329386 turn 10): a marked wall
+  destroyed mid-phase appears to yield a partial refund (~hp-correlated, +0.22 observed)
+  that we don't model; our refunds (survivors at end-of-phase health) match the other 7
+  removals exactly. Magnitude <=0.8 SP, frequency ~0.3% of turns (mass-marking bots).
+  Candidate mechanisms tested and failed: mark-time valuation (5.68), per-refund
+  rounding modes (4.8/4.9/5.5), all-8-at-end (n/a). Deployment unaffected (server SP is
+  read each turn); training impact negligible.
+- Engine's own shield event amounts confirm the pure-f32 amount chain: production replay
+  15327711 serializes a grant amount as literal "6.1000004" = f32 chain of 4 + 0.3f*7.
+
+## Historical fix specs (superseded by the section above)
 
 1. **Self-destruct AoE must hit 0-health units too.** The engine's SD damages every enemy
    unit in range whose removal hasn't happened yet (step 4), INCLUDING units already at

@@ -147,24 +147,31 @@ impl State {
     ) {
         for (i, &cmd) in cmds.iter().enumerate() {
             let id = forced_ids.map(|ids| ids[i]);
-            let ok = self.apply_one(owner, cmd, id, accepted);
+            let ok = self.apply_one(owner, cmd, id, false, accepted);
             if !ok && strict {
-                // An engine-accepted command our model rejects = a validation-model gap.
-                // Report loudly with full context, then force-apply so the diff can
-                // continue localizing the real divergence.
-                println!(
-                    "VALIDATION GAP: sim rejected engine-accepted {:?} (owner {}, sp {}, mp {}, blocked {:?})",
-                    cmd,
-                    owner,
-                    self.sp[owner as usize],
-                    self.mp[owner as usize],
-                    match cmd {
-                        Cmd::Build { x, y, .. }
-                        | Cmd::Upgrade { x, y }
-                        | Cmd::Remove { x, y }
-                        | Cmd::Deploy { x, y, .. } => self.structure_at(x, y).is_some(),
-                    }
-                );
+                // An engine-accepted command our model rejects. Affordability rejections
+                // are the known bounded MP-drift (MECHANICS §Open fixes 3): force-apply
+                // (resources may dip fractionally negative) so the phase stays faithful.
+                // A GEOMETRY rejection under force would be a real modeling bug — loud.
+                let forced = self.apply_one(owner, cmd, id, true, accepted);
+                if forced {
+                    println!(
+                        "AFFORDABILITY GAP (forced): {:?} owner {} sp {:.4} mp {:.4}",
+                        cmd, owner, self.sp[owner as usize], self.mp[owner as usize]
+                    );
+                } else {
+                    println!(
+                        "GEOMETRY GAP (real bug!): sim rejected engine-accepted {:?} (owner {}, blocked {:?})",
+                        cmd,
+                        owner,
+                        match cmd {
+                            Cmd::Build { x, y, .. }
+                            | Cmd::Upgrade { x, y }
+                            | Cmd::Remove { x, y }
+                            | Cmd::Deploy { x, y, .. } => self.structure_at(x, y).is_some(),
+                        }
+                    );
+                }
             }
         }
     }
@@ -180,6 +187,7 @@ impl State {
         owner: u8,
         cmd: Cmd,
         forced_id: Option<u32>,
+        force_afford: bool,
         accepted: &mut Vec<(Cmd, u32)>,
     ) -> bool {
         let cfg = self.cfg.clone();
@@ -192,7 +200,10 @@ impl State {
                     return false;
                 }
                 let st = cfg.stats(kind, false);
-                if !st.is_structure || self.sp[owner as usize] < st.cost_sp {
+                if !st.is_structure {
+                    return false;
+                }
+                if !force_afford && self.sp[owner as usize] < st.cost_sp {
                     return false;
                 }
                 self.sp[owner as usize] -= st.cost_sp;
@@ -228,7 +239,10 @@ impl State {
                     (s.kind, s.upgraded, s.health, s.max_health)
                 };
                 let base = cfg.stats(kind, false);
-                if upgraded || !base.has_upgrade || self.sp[owner as usize] < base.upgrade_cost_sp {
+                if upgraded || !base.has_upgrade {
+                    return false;
+                }
+                if !force_afford && self.sp[owner as usize] < base.upgrade_cost_sp {
                     return false;
                 }
                 self.sp[owner as usize] -= base.upgrade_cost_sp;
@@ -259,8 +273,10 @@ impl State {
                 if st.is_structure
                     || !geo::in_bounds(x as i32, y as i32)
                     || !Self::own_spawnable(self, owner, x, y)
-                    || self.mp[owner as usize] < st.cost_mp
                 {
+                    return false;
+                }
+                if !force_afford && self.mp[owner as usize] < st.cost_mp {
                     return false;
                 }
                 self.mp[owner as usize] -= st.cost_mp;

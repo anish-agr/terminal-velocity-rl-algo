@@ -332,18 +332,35 @@ def phase_package(cfg: dict, config: dict, run_dir: str,
         shutil.copy(so, out_dir)
         shipped.append(os.path.basename(so))
     if not shipped:
-        # pod reality: maturin leaves a .whl (never a loose .so) and pip
-        # installs the module into site-packages — ship the installed file.
-        # Its name (terminal_sim.abi3.so) is directly importable next to
-        # algo_strategy.py, which is rung 1 of the deploy ladder.
+        # pod reality: maturin emits a .whl (never a loose .so) and pip installs
+        # the module into site-packages. TWO layouts exist and both are seen in
+        # the wild: a bare terminal_sim.abi3.so, or a package DIRECTORY holding
+        # __init__.py + the .so (what the pilot pod actually has). Ship whichever
+        # is present, preserving `import terminal_sim` next to algo_strategy.py
+        # (rung 1 of the deploy ladder). Shipping only the inner .so out of a
+        # package layout would NOT import — the package dir must go as a unit.
         try:
             import terminal_sim as _ts
             src = getattr(_ts, "__file__", "") or ""
             if src.endswith(".so"):
                 shutil.copy(src, os.path.join(out_dir, os.path.basename(src)))
                 shipped.append(os.path.basename(src))
-        except Exception:
-            pass
+            elif os.path.basename(src) == "__init__.py":
+                pkg = os.path.dirname(src)
+                dst = os.path.join(out_dir, os.path.basename(pkg))
+                shutil.copytree(pkg, dst,
+                                ignore=shutil.ignore_patterns("__pycache__"))
+                # auditwheel/manylinux may park bundled deps in a sibling
+                # <pkg>.libs dir; without it the .so fails to dlopen
+                libs = pkg + ".libs"
+                if os.path.isdir(libs):
+                    shutil.copytree(libs, os.path.join(
+                        out_dir, os.path.basename(libs)))
+                shipped.extend(sorted(
+                    os.path.relpath(p, out_dir) for p in
+                    glob.glob(os.path.join(dst, "**", "*.so"), recursive=True)))
+        except Exception as exc:
+            print("sim bridge copy failed: {!r}".format(exc), flush=True)
     if shipped:
         print("sim bridge shipped: {}".format(", ".join(shipped)), flush=True)
     elif sys.platform.startswith("linux"):

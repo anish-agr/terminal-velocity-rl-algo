@@ -246,7 +246,8 @@ def phase_loop(cfg: dict, config: dict, run_dir: str, hours: float,
                     device="cuda" if _cuda() else "cpu",
                     max_steps=None if hours >= 1e6 else
                     int(cfg["learning"]["total_steps"]),
-                    deadline_ts=deadline)
+                    deadline_ts=deadline,
+                    server_alive=server.is_alive)
     finally:
         request_q.put(("stop",))
         for p in actors:
@@ -299,9 +300,35 @@ def phase_package(cfg: dict, config: dict, run_dir: str,
             shutil.copy(src, os.path.join(out_dir, name))
     with open(os.path.join(out_dir, "deploy_config.json"), "w") as fh:
         json.dump(cfg, fh)
+    shipped = []
     for so in glob.glob(os.path.join(_REPO, "sim", "target", "wheels", "*.so")) + \
             glob.glob(os.path.join(_REPO, "sim", "*.so")):
         shutil.copy(so, out_dir)
+        shipped.append(os.path.basename(so))
+    if not shipped:
+        # pod reality: maturin leaves a .whl (never a loose .so) and pip
+        # installs the module into site-packages — ship the installed file.
+        # Its name (terminal_sim.abi3.so) is directly importable next to
+        # algo_strategy.py, which is rung 1 of the deploy ladder.
+        try:
+            import terminal_sim as _ts
+            src = getattr(_ts, "__file__", "") or ""
+            if src.endswith(".so"):
+                shutil.copy(src, os.path.join(out_dir, os.path.basename(src)))
+                shipped.append(os.path.basename(src))
+        except Exception:
+            pass
+    if shipped:
+        print("sim bridge shipped: {}".format(", ".join(shipped)), flush=True)
+    elif sys.platform.startswith("linux"):
+        raise SystemExit(
+            "no terminal_sim .so found to ship — without it the deployed bot "
+            "silently plays FallbackBot (no search). Run train/setup_runpod.sh "
+            "and package on the pod.")
+    else:
+        print("WARNING: no terminal_sim .so shipped (non-linux packaging box) "
+              "— the deployed bot would fall back to FallbackBot. Package the "
+              "real submission on the pod.", flush=True)
 
     total = sum(os.path.getsize(os.path.join(dp, f))
                 for dp, _dn, fn in os.walk(out_dir) for f in fn)

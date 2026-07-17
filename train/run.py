@@ -201,6 +201,12 @@ def phase_loop(cfg: dict, config: dict, run_dir: str, hours: float,
 
     _require_sim()
     mp.set_start_method("spawn", force=True)
+    # each spawned child inherits these; without them libgomp/BLAS sizes one
+    # thread pool PER HOST CORE per process (128 x n_actors threads on the
+    # pilot pod -> "libgomp: Thread creation failed" killed the phase).
+    # Actors/server do tiny per-call numpy ops; 1 BLAS thread each is right.
+    for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ.setdefault(_var, "1")
     try:
         # container cpuset = the pod's REAL vCPU allocation; os.cpu_count()
         # reports the host's core count inside RunPod containers (128 on a

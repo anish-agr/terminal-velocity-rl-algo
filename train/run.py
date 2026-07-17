@@ -83,9 +83,11 @@ class ClientFactory:
 
 def bc_positions_from_corpus(cfg: dict, config: dict, replay_dir: str,
                              limit: int = None):
-    """Replay corpus -> learner-schema positions. Winner sides get their
-    executed plan as the single candidate (pi=1) — the BC prior; loser sides
-    get EMPTY candidates (value/aux/prediction signal only, §13)."""
+    """Replay corpus -> learner-schema positions, YIELDED one list per replay
+    (streaming: the full corpus is tens of GB featurized and must never be
+    materialized in one list). Winner sides get their executed plan as the
+    single candidate (pi=1) — the BC prior; loser sides get EMPTY candidates
+    (value/aux/prediction signal only, §13)."""
     from .replays import build_bc_index, iter_positions, load_game
 
     bc_index = dict(build_bc_index(replay_dir, config,
@@ -93,7 +95,6 @@ def bc_positions_from_corpus(cfg: dict, config: dict, replay_dir: str,
     names = [n for n in sorted(os.listdir(replay_dir)) if n.endswith(".replay")]
     if limit:
         names = names[:limit]
-    out = []
     for name in names:
         path = os.path.join(replay_dir, name)
         rec = load_game(path, config)
@@ -102,6 +103,7 @@ def bc_positions_from_corpus(cfg: dict, config: dict, replay_dir: str,
         bc_side = bc_index.get(path)          # None -> no policy target
         game_positions = list(iter_positions(rec, config))
         by_key = {(p.side, p.turn): p for p in game_positions}
+        out = []
         for p in game_positions:
             opp = by_key.get((1 - p.side, p.turn))
             if opp is None:
@@ -118,7 +120,7 @@ def bc_positions_from_corpus(cfg: dict, config: dict, replay_dir: str,
                 "opp_mp": opp.mp, "opp_plan": opp.plan,
                 "z": p.z, "aux": p.aux,
             })
-    return out
+        yield out
 
 
 def phase_bootstrap(cfg: dict, config: dict, run_dir: str,
@@ -135,11 +137,12 @@ def phase_bootstrap(cfg: dict, config: dict, run_dir: str,
     learner = Learner(cfg, config,
                       device="cuda" if _cuda() else "cpu")
 
-    print("== Stage A: corpus ingestion ==", flush=True)
-    positions = bc_positions_from_corpus(cfg, config, replay_dir)
-    learner.buffer.add_many(positions)
-    print("corpus positions: {}".format(len(positions)), flush=True)
-
+    # Seed games FIRST, corpus SECOND. The buffer is a FIFO capped at
+    # buffer_capacity, and 7,500 seed games alone are ~750K positions — added
+    # after the corpus they silently evicted EVERY corpus position, so BC
+    # trained with zero imitation targets (observed on the pod: loss_policy
+    # exactly 0.0 for all 2,000 bc steps). With the corpus last, the imitation
+    # data survives and whatever seed fraction still fits provides diversity.
     print("== Stage A: scripted seed games (§6.3) ==", flush=True)
     from .scripted import SCRIPTED_BOTS
     names = sorted(SCRIPTED_BOTS.keys())
@@ -157,6 +160,17 @@ def phase_bootstrap(cfg: dict, config: dict, run_dir: str,
         learner.ingest(meta, pos)
         if (i + 1) % 500 == 0:
             print("seed games: {}/{}".format(i + 1, n_seed), flush=True)
+
+    print("== Stage A: corpus ingestion ==", flush=True)
+    n_corpus = 0
+    for chunk in bc_positions_from_corpus(cfg, config, replay_dir):
+        learner.buffer.add_many(chunk)
+        n_corpus += len(chunk)
+    print("corpus positions: {} (buffer now {})".format(
+        n_corpus, len(learner.buffer)), flush=True)
+    if n_corpus == 0:
+        print("WARNING: zero corpus positions — BC will have no imitation "
+              "targets (check replays/scraped/ on this machine)", flush=True)
 
     print("== Stage A: training {} steps ==".format(bc_steps), flush=True)
     for i in range(bc_steps):
@@ -187,8 +201,14 @@ def phase_loop(cfg: dict, config: dict, run_dir: str, hours: float,
 
     _require_sim()
     mp.set_start_method("spawn", force=True)
-    n_actors = max(1, (os.cpu_count() or 2) - 2) * \
-        int(cfg["actors"]["per_vcpu"]) // 2
+    try:
+        # container cpuset = the pod's REAL vCPU allocation; os.cpu_count()
+        # reports the host's core count inside RunPod containers (128 on a
+        # 16-vCPU pod -> 126 actors thrashing 16 cores)
+        n_cpu = len(os.sched_getaffinity(0))
+    except AttributeError:
+        n_cpu = os.cpu_count() or 2
+    n_actors = max(1, n_cpu - 2) * int(cfg["actors"]["per_vcpu"]) // 2
 
     cfg = json.loads(json.dumps(cfg))          # deep copy; apply phase K/M
     cfg["search"]["k_train"], cfg["search"]["m_train"] = k, m

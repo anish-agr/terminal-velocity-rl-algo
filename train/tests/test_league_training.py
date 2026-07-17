@@ -361,6 +361,49 @@ def test_buffer_mirror():
             assert plan[-1].type == END
 
 
+def test_predict_head_trains_on_opponent_perspective_features():
+    """search.py feeds the predict head board_opp (opponent-perspective torso
+    output); training must compute its NLL on those same features. If the
+    predict loss instead read the own-perspective features, it would be blind
+    to opp_board entirely — perturbing opp_board must move loss_predict and
+    NOTHING else."""
+    import torch
+
+    meta, positions = _run_one_game()
+
+    def one_step(perturb_opp):
+        torch.manual_seed(0)                     # identical net init both runs
+        learner = Learner(_CFG, _CONFIG, seed=0)  # identical sampling/mirrors
+        pos = [dict(p) for p in positions]
+        if perturb_opp:
+            for p in pos:
+                p["opp_board"] = (p["opp_board"] + 0.5).astype(np.float32)
+        learner.ingest({"opponent_kind": "current", "winner": meta["winner"],
+                        "me": 0}, pos)
+        return learner.train_step()
+
+    base, pert = one_step(False), one_step(True)
+    assert abs(base["loss_value"] - pert["loss_value"]) < 1e-6
+    assert abs(base["loss_policy"] - pert["loss_policy"]) < 1e-6
+    assert abs(base["loss_predict"] - pert["loss_predict"]) > 1e-5, \
+        "predict loss ignored opp_board — trained on the wrong perspective"
+
+
+def test_run_learner_exits_when_server_dies():
+    """A dead inference server stalls every actor forever; the learner (which
+    only sees an empty trajectory queue) must notice and end the phase instead
+    of idling out a no-deadline main run."""
+    from train.learner import run_learner
+
+    cfg = copy.deepcopy(_CFG)
+    with tempfile.TemporaryDirectory() as td:
+        t0 = time.time()
+        run_learner(queue.Queue(), queue.Queue(), cfg, _CONFIG, td,
+                    deadline_ts=time.time() + 60.0,
+                    server_alive=lambda: False)
+        assert time.time() - t0 < 10.0, "did not break out on server death"
+
+
 def test_run_learner_resumes_and_preserves_league():
     """run_learner must CONTINUE from run_dir (run.py's phase contract):
     reload checkpoint.pt (net+opt+step), keep league.json's anchor flag /
@@ -387,8 +430,14 @@ def test_run_learner_resumes_and_preserves_league():
         tq = queue.Queue()
         tq.put(({"opponent_kind": "current", "winner": meta["winner"],
                  "me": 0}, positions))
-        run_learner(tq, queue.Queue(), cfg, _CONFIG, td,
+        cq = queue.Queue()
+        run_learner(tq, cq, cfg, _CONFIG, td,
                     deadline_ts=time.time() + 2.0)
+
+        # resume must immediately re-sync the hot-reload weights to the
+        # restored checkpoint (crash can leave weights_current.pt newer)
+        assert cq.get_nowait() == (
+            "reload", "current", os.path.join(td, "weights_current.pt"))
 
         fresh = Learner(cfg, _CONFIG, seed=1)
         fresh.load_checkpoint(os.path.join(td, "checkpoint.pt"))

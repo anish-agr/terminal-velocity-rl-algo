@@ -99,7 +99,8 @@ def test_bc_positions_from_corpus():
     cfg = load_cfg()
     with tempfile.TemporaryDirectory() as td:
         _write_synthetic_replay(os.path.join(td, "g0.replay"))
-        positions = bc_positions_from_corpus(cfg, _CONFIG, td)
+        positions = [p for chunk in bc_positions_from_corpus(cfg, _CONFIG, td)
+                     for p in chunk]                      # streamed per replay
         assert len(positions) == 4                        # 2 turns x 2 sides
         winners = [p for p in positions if p["candidates"]]
         losers = [p for p in positions if not p["candidates"]]

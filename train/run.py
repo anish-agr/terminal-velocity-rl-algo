@@ -203,6 +203,35 @@ def phase_bootstrap(cfg: dict, config: dict, run_dir: str,
 # Pilot / main — the full loop (§5.5 topology)
 # ---------------------------------------------------------------------------
 
+def _pod_cpus() -> int:
+    """The pod's REAL cpu allocation, in preference order: cgroup CPU quota
+    (what RunPod actually enforces and bills), then cpu affinity, then count.
+    Both os.cpu_count() AND sched_getaffinity report the 128-core HOST inside
+    these containers (observed: 126 actors spawned on a 16-vCPU pod even
+    after the affinity-based fix — the cpuset is simply not restricted).
+    TV_ACTORS in the environment overrides the whole calculation."""
+    try:  # cgroup v1 (the pilot pod's layout)
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") as fh:
+            quota = int(fh.read())
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us") as fh:
+            period = int(fh.read())
+        if quota > 0 and period > 0:
+            return max(1, quota // period)
+    except (OSError, ValueError):
+        pass
+    try:  # cgroup v2
+        with open("/sys/fs/cgroup/cpu.max") as fh:
+            parts = fh.read().split()
+        if len(parts) == 2 and parts[0] != "max":
+            return max(1, int(parts[0]) // int(parts[1]))
+    except (OSError, ValueError):
+        pass
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 2
+
+
 def phase_loop(cfg: dict, config: dict, run_dir: str, hours: float,
                k: int, m: int) -> None:
     import multiprocessing as mp
@@ -215,14 +244,10 @@ def phase_loop(cfg: dict, config: dict, run_dir: str, hours: float,
     # BLAS/OpenMP thread caps are set at module import (top of this file);
     # spawned actors/server inherit them via os.environ. Actors/server do
     # tiny per-call numpy ops; 1 BLAS thread each is right.
-    try:
-        # container cpuset = the pod's REAL vCPU allocation; os.cpu_count()
-        # reports the host's core count inside RunPod containers (128 on a
-        # 16-vCPU pod -> 126 actors thrashing 16 cores)
-        n_cpu = len(os.sched_getaffinity(0))
-    except AttributeError:
-        n_cpu = os.cpu_count() or 2
-    n_actors = max(1, n_cpu - 2) * int(cfg["actors"]["per_vcpu"]) // 2
+    n_actors = int(os.environ.get("TV_ACTORS", "0") or "0")
+    if n_actors <= 0:
+        n_cpu = _pod_cpus()
+        n_actors = max(1, n_cpu - 2) * int(cfg["actors"]["per_vcpu"]) // 2
 
     cfg = json.loads(json.dumps(cfg))          # deep copy; apply phase K/M
     cfg["search"]["k_train"], cfg["search"]["m_train"] = k, m

@@ -1,10 +1,194 @@
 # Terminal Engine Mechanics — VERIFIED SPEC (this competition's ruleset)
 
-Status: **frame-exact vs engine.jar across the full corpus** (4 matches, 2,719 action
-frames: starter mirror, torture mirror, torture-vs-starter, probe-vs-torture). Unit
-positions/healths/events bit-exact; resources within one display tick (see §Serialization).
-Verification tool: `sim/target/release/tsim diff <replay>`. Re-run on every sim change and
-on every new replay.
+Status: **frame-exact vs engine.jar across the local corpus** (4 matches, 2,719 action
+frames). **Production-server replays** (pulled via
+`https://terminal.c1games.com/api/game/replayexpanded/<id>` — public, no auth) confirm the
+server runs the same engine and a gameplay-identical config (diffs are icon fields only).
+Two gaps surfaced by server replays, both characterized (see §Open fixes). Verification
+tool: `sim/target/release/tsim diff <replay>`. Re-run on every sim change and every new
+replay.
+
+## Fix status (2026-07-16, round 3 — full corpus revalidation, 3,847 replays)
+
+Full re-validation via `scripts/batch_diff.sh` against `replays/scraped/*.replay` (all
+3,847 files, using the corrected `tsim.exe` — see below for the corrupted-binary incident
+this superseded): **3,489/3,847 full-replay PASS (90.7%), frame-exact 3,446,733/3,451,316
+(99.8672%)**.
+
+**Corrupted-binary incident (caught before being reported as fact):** an intervening
+`cargo build --release --features python` (run to refresh `terminal_sim.pyd`) silently
+rebuilt the standalone `tsim` CLI binary under PyO3's `extension-module` ABI too — Cargo
+applies `--features` package-wide by default, and that ABI makes the CLI binary exit 0 with
+zero output when run outside a Python host process. A batch run against that broken binary
+produced a nonsensical "243/3103 PASS, 99.9967% frame-exact" result (internally
+inconsistent — frame count crashed to ~241K from an expected ~3.86M, several worst-10
+entries were literal all-zero rows, a crash signature). Fixed by rebuilding the plain
+feature-free binary (`cargo build --release`, no features) before any fidelity gate, and
+the same ordering hazard was fixed in `train/setup_runpod.sh` (which built the python wheel
+*before* its fidelity gate — would have failed the gate on every pod run). Repo-wide grep
+confirmed no other script has this hazard.
+
+**Root cause of the dominant remaining divergence category (diagnosed, NOT a sim bug):**
+triaged the worst-10 replays by frame-mismatch count (594, 256, 182, 178, 153, 150, 110, 77,
+77, 77 — a handful of replays account for a disproportionate share of the corpus's frame
+mismatches because one divergence cascades forward for the rest of that replay). Every one
+of the 5 checked has the identical signature: the FIRST divergence is a small (1-3 point)
+player-HP mismatch at a turn-boundary frame, with **zero** breach/damage/selfDestruct event
+anywhere in that frame's event log, and no enemy mobile unit anywhere near the breaching
+edge. Confirmed by exhaustively scanning one full replay (15330159) for every breach event
+of either owner across the whole game: player 1's HP always drops in perfect lock-step with
+a logged owner=2 breach event in the same frame (correct, expected) — but player 2's HP
+drops twice (turn 26, turn 30) with **no owner=1 breach event anywhere in the entire
+replay**. Replay frames carry no compute-time metadata at all.
+
+This matches the competition's own turn-timer rule (5s soft limit, **1 HP/sec penalty for
+time over the limit**, 35s = skipped turn) — a real bot on the ladder occasionally thinking
+too long and eating an HP penalty that is a pure server-side artifact of that bot's
+wall-clock compute time, invisible in the replay JSON. A rules-only simulator cannot
+reconstruct this from replay data under any circumstances — it isn't a state-transition bug,
+it's missing input. **Do not chase this further** — it inflates the "divergent replay" count
+without reflecting any real engine inaccuracy. True engine fidelity (excluding
+compute-time-penalty replays) is materially higher than the raw 90.7%/99.87% headline
+numbers. If a specific replay needs to be confirmed as a timeout case vs. a real bug, look
+for the same signature (isolated small HP delta, zero causal event, no enemy unit near the
+edge) before assuming it's fixable.
+
+## Fix status (2026-07-16, round 2 — externally reported drift bugs)
+
+Four externally-reported "critical drift bugs" were verified against fresh replay evidence
+before touching anything (per the audit-first policy below). Two were real; the sim's
+overall fidelity on a fixed 443-replay sample (deterministic subset, every 7th scraped
+replay by ID) moved from **99.13% -> 99.93% frame-exact** and **98.61% -> 99.73%
+restore-exact** as a direct result — a ~13x and ~5x reduction in residual error rate,
+respectively, with zero regression on any metric. Full 3,103-replay corpus re-run in
+progress; see `replays/scraped/diff_results.tsv` for the latest numbers.
+
+1. **CONFIRMED — SP refund quantized PER STRUCTURE to the nearest tenth, round-half-up,
+   before being summed/credited.** Root-caused against `scraped/15327732.replay` turn 16
+   (P2 removes 4 walls + 2 upgraded walls): raw refund sum = 5.146667, engine-observed
+   refund = 5.100000. Then validated at scale: scanned every scraped replay for turns
+   where a player's ONLY frame0 commands were REMOVEs (isolates the SP delta cleanly),
+   found 229 such turns across 400 replays, and checked the observed SP delta against
+   raw-sum / floor-sum / round-sum / ceil-sum of the individually-computed refunds (using
+   each structure's health at the END of that turn's action phase, matching our
+   restore-time execute_removals). Result: **round-sum matches 229/229; raw only 184/229;
+   floor 206/229; ceil 199/229.** Fix applied in `state.rs::execute_removals`:
+   `refund = (raw*10.0 + 0.5).floor() / 10.0` per structure, summed after.
+2. **CONFIRMED — upgrading a structure assigns it a NEW engine id, and that id becomes its
+   new attack-order tie-break seq.** Root-caused against the same replay, turn 8: a wall
+   built at (22,15) gets id 143; upgrading it the same turn logs a SEPARATE spawn event,
+   id 158, same tile. Our sim already advanced the global id counter on upgrade (so
+   replay-mode id matching was fine) but never wrote the new id back onto the structure's
+   own `seq` field — which is what attack ordering actually sorts by. Almost certainly the
+   dominant contributor to the "rare targeting near-ties" residual documented below. Fix:
+   `state.rs::apply_one` (Upgrade arm) now sets `s.id = id; s.seq = id;` from the same
+   `take_id()` call already in use.
+3. **REFUTED — "build over an existing structure."** Claimed evidence: P1 builds at
+   (0,13)/(1,13)/(2,13) on turn 24 of `15327732.replay`, tiles that held a wall+2 turrets
+   at turn 23. Traced directly: those three structures show ordinary COMBAT deaths
+   (`removal_flag=False`) at turn 23 frame 26 — destroyed by enemy fire, not replaced.
+   By turn 24's deploy the tiles are already empty; these are unremarkable builds onto
+   empty ground, which the engine already handles correctly (Deaths step clears the grid
+   entry same-frame). No such mechanic exists; it would also contradict the rules text
+   ("no two Structures can occupy the same location"). `Cmd::Build`'s occupancy check is
+   unchanged.
+4. **REFUTED as a distinct bug — `upgrade_cost_sp` JSON fallback.** Claimed the config
+   parser falls back to 0.0 for a missing `upgrade.cost1`, producing a 0.4 SP variance at
+   turn 21 of the same replay. The parser already falls back to the BASE unit's cost (not
+   0.0) — `unwrap_or(base_cost_sp)` — independently verified correct earlier via turn-0 SP
+   accounting (season config: wall upgrade omits cost1, engine charges 1 SP = base cost).
+   The claimed 0.4 SP variance is fully explained by bug #1 above (unrounded refund sum);
+   a single upgraded-wall refund's raw-vs-rounded gap is easily that large. config.rs
+   unchanged.
+
+## Fix status (2026-07-16, round 1)
+
+APPLIED & validated: (1) SD AoE hits <=0-health units — ladder replays now frame-exact;
+(2) action phase ends immediately when a player reaches 0 HP mid-phase (engine stops
+emitting frames — ladder-15330187 turn 27); (3) replay harness force-applies
+engine-accepted commands past affordability (bounded MP drift, §3 below) and screams
+"GEOMETRY GAP" if a forced command is structurally impossible (= real bug); (4) unit
+health comparison quantized to 0.01 (absorbs shield-pool f32 dust <=1e-3).
+CONFIRMED-CORRECT after a false fix attempt: shield grant amount is the PURE f32 chain
+`shieldPerUnit + shieldBonusPerY * own_y` (local engine grants print "6.7" = exactly what
+the f32 chain yields; widening through the f32-stored config to f64 lands one ulp HIGH —
+reverted; see engine.rs comment).
+
+KNOWN RESIDUALS (characterized, deliberately not chased):
+- platform-probe-match turns 44 & 55 (3 frames of 4,114): rare attacker/target
+  disagreement under near-ties (two turrets, equal-range equal-health targets) —
+  reproduction pointers preserved in that replay; revisit only if scaled validation shows
+  the pattern is common.
+- SHIELD ATTRIBUTION in deep stacks (scraped/15327711 turn 15 frame 26): with ~18 scouts
+  stacked, TWO units ended the phase missing exactly two specific supports' grants
+  (6.4 + 4.6 = the observed 11.0 hp delta) in the engine while our sim granted uniformly;
+  event multisets match (grants differ only in receiving unit ID). Hypothesis space:
+  engine's once-per-pair bookkeeping interacts with unit iteration order when stacks
+  split. NOTE: a strict dist<range shield-boundary experiment (excluding d2=49 for range
+  7.0) was tested and REFUTED — it regressed the previously-exact corpus; inclusive
+  d2<=49 is correct. Frequency quantified by the corpus batch run (diff_results.tsv).
+- resource micro-drift on long banking chains (§Open fix 3 below) — bounded < 0.1,
+  mitigations in place, mathematically shown unresolvable from replay data alone.
+- REFUND of marked-then-destroyed structures (scraped/15329386 turn 10): a marked wall
+  destroyed mid-phase appears to yield a partial refund (~hp-correlated, +0.22 observed)
+  that we don't model; our refunds (survivors at end-of-phase health) match the other 7
+  removals exactly. Magnitude <=0.8 SP, frequency ~0.3% of turns (mass-marking bots).
+  Candidate mechanisms tested and failed: mark-time valuation (5.68), per-refund
+  rounding modes (4.8/4.9/5.5), all-8-at-end (n/a). Deployment unaffected (server SP is
+  read each turn); training impact negligible.
+- Engine's own shield event amounts confirm the pure-f32 amount chain: production replay
+  15327711 serializes a grant amount as literal "6.1000004" = f32 chain of 4 + 0.3f*7.
+
+## Historical fix specs (superseded by the section above)
+
+1. **Self-destruct AoE must hit 0-health units too.** The engine's SD damages every enemy
+   unit in range whose removal hasn't happened yet (step 4), INCLUDING units already at
+   ≤0 health from earlier SDs this frame; our sim filters `health > 0`, producing fewer
+   damage events and shorter SD target lists (ladder replay turns 7/12/14/19: sim damage
+   15 vs engine 20, etc.). FIX: in the SD branch of the movement step, drop the
+   `health > 0` filters on both mobile and structure targets (keep `alive`); the 0-health
+   exclusion applies to ATTACK targeting only. Gate: both ladder replays reach the same
+   pass-rate profile as the platform-probe replay.
+2. **Shield-pool micro-dust (±4e-6 HP).** Platform 100-turn replay: units with many
+   stacked grants (8 observed) differ from the engine by ~4e-6 (sim 11.600002 vs engine
+   11.599998) — the engine computes the grant amount along a different float path than
+   our f32 chain (likely f64 `shieldPerUnit + bonus*y` cast to f32 once). FIX (two-part):
+   (a) compute the amount in f64, cast to f32 at grant time; if residue persists, (b) add
+   a relative epsilon of 1e-4 to the diff's unit-health comparison ONLY (never to
+   positions/events), documented as characterized dust. Materiality: damage values are
+   integers; a 4e-6 health offset changes a kill threshold only if effective health sits
+   within 4e-6 of an exact damage multiple — negligible, but keep exactness where free.
+3. **Bounded MP micro-drift on long banking chains (BOTH signs, ≤ ~0.1).** Exhaustive
+   model search (32 variants: f32/f64 × mul/sub × {none, round, rint, ceil, floor}-at-
+   tenths × ceil/round display) — NO variant survives chain validation across the corpus;
+   the pure-banking chain in ladder-15330187 requires engine-internal values that cannot
+   arise from ANY function of the displayed state (t2 must exceed 8.7627 while exact
+   arithmetic from turn 0 gives 8.75; yet at t17 the engine sits BELOW the raw chain).
+   Model kept: raw f32 (best fit, simplest). Consequences + mitigations:
+   - replay harness: per-turn resync + one-display-tick stats tolerance (in place);
+   - deployment: read own resources from the server state every turn; plan spends with a
+     0.1 margin at integer boundaries; deploys the engine can't afford are SILENTLY
+     SKIPPED, so optimistic attempts are free — attempt the marginal unit, never rely on it;
+   - self-play training: unaffected (the sim is its own engine, exactly self-consistent).
+
+## External bug-report audit (2026-07-15) — verify before "fixing"
+
+Three reported "critical bugs" were tested against engine data. Verdicts:
+- **"Shields are capped / max-overwrite instead of additive" — REFUTED.** The platform
+  100-turn replay shows one unit receiving 8 separate shield grants; an interceptor
+  reached 56.6 HP (40 + 16.6) and a demolisher 46.6 (5 + 41.6). Pure summation passes
+  4,094/4,114 frames on that replay. No 44.1-HP unit exists anywhere in the corpus. The
+  rules page also states "no limit to the amount of shielding". Do NOT change.
+- **"Frame order must be shields → movement → attacks" — REFUTED.** Dispositive event
+  evidence: scouts spawned at (13,0) inside a support's range receive their grant with
+  target location (13,1) — their POST-move tile (turn-5/7 frame-0 shield events, local
+  corpus). Movement→shields→attacks passes 7,500+ frames including production. Reverting
+  to the rules-page order would itself introduce the 1-frame lag the report describes.
+- **"Engine quantizes MP to tenth/hundredth after decay; spawn accepted at 1.0 vs sim
+  0.9977" — MECHANISM REFUTED, underlying issue REAL.** All quantization variants fail
+  chain validation (see Open fix 3, which also covers the affordability symptom: engine
+  accepted deploys our chain under-affords by <0.1). Handled by Open fix 3 mitigations,
+  not by quantizing.
 
 ## Numerics (hard-won, do not regress)
 

@@ -319,7 +319,9 @@ pub fn play_turn(
                                 continue;
                             }
                             let o = &st.mobiles[oi];
-                            if !o.alive || o.owner == owner || o.health <= 0.0 {
+                            // ≤0-health units still take SD damage (they are only
+                            // removed at step 4) — ladder-replay-confirmed
+                            if !o.alive || o.owner == owner {
                                 continue;
                             }
                             if geo::dist2(x as i32, y as i32, o.x as i32, o.y as i32) <= thr {
@@ -338,7 +340,7 @@ pub fn play_turn(
                                 }
                                 if let Some(sidx) = st.structure_at(tx as i8, ty as i8) {
                                     let s = &st.structures[sidx];
-                                    if s.owner != owner && s.alive && s.health > 0.0 {
+                                    if s.owner != owner && s.alive {
                                         let (sx2, sy2, skind, sowner) = (s.x, s.y, s.kind, s.owner);
                                         st.structures[sidx].health -= stats.sd_tower;
                                         summary.structure_damage_dealt[owner as usize] +=
@@ -371,6 +373,11 @@ pub fn play_turn(
             let stats = cfg.stats(config::SUPPORT, s.upgraded);
             let thr = cfg.shield_d2[config::SUPPORT as usize][s.upgraded as usize];
             let own_y = if s.owner == 0 { s.y as f32 } else { (27 - s.y) as f32 };
+            // Pure f32 chain — VERIFIED against the local engine (grants print "6.7" =
+            // f32(6.7), which this chain produces; an f64-widened variant lands one ulp
+            // high because the config value is f32-stored). The platform replay's ±4e-6
+            // pool residue on many-grant units is a separate micro-issue absorbed by the
+            // diff's 1e-4 relative health epsilon; do NOT "fix" it here again.
             let amount = stats.shield_per_unit + stats.shield_bonus_per_y * own_y;
             let (sx, sy, sowner) = (s.x, s.y, s.owner);
             for mi in 0..st.mobiles.len() {
@@ -463,7 +470,9 @@ pub fn play_turn(
         frames.push(FrameRec { stats: snapshot_stats(st), units: snapshot_units(st), ev });
 
         f += 1;
-        if !st.mobiles.iter().any(|m| m.alive) {
+        // phase ends when no mobiles remain OR the game is decided (a breach dropped a
+        // player to 0 HP mid-phase — engine stops emitting frames immediately)
+        if !st.mobiles.iter().any(|m| m.alive) || st.hp[0] <= 0.0 || st.hp[1] <= 0.0 {
             break;
         }
         if f > 2000 {

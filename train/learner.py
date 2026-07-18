@@ -214,11 +214,19 @@ class Learner:
 
         boards = torch.from_numpy(np.stack([p["board"] for p in batch])).to(self.device)
         scalars = torch.from_numpy(np.stack([p["scalars"] for p in batch])).to(self.device)
+        opp_boards = torch.from_numpy(
+            np.stack([p["opp_board"] for p in batch])).to(self.device)
+        opp_scalars = torch.from_numpy(
+            np.stack([p["opp_scalars"] for p in batch])).to(self.device)
         z = torch.tensor([p["z"] for p in batch], dtype=torch.float32,
                          device=self.device)
         aux_t = torch.from_numpy(np.stack([p["aux"] for p in batch])).to(self.device)
 
         feat, g_vec = self.net.forward_torso(boards, scalars)
+        # the predict head is fed board_opp at inference (search.py samples
+        # opponent plans on the OPPONENT-perspective torso output) — its NLL
+        # must be computed on those same features, not the own-perspective ones
+        feat_opp, g_opp = self.net.forward_torso(opp_boards, opp_scalars)
         v = self.net.value(g_vec)
         loss_value = ((v - z) ** 2).mean()
         loss_aux = ((self.net.aux(g_vec) - aux_t) ** 2).sum(dim=1).mean()
@@ -283,8 +291,17 @@ class Learner:
             dev = self.device
             src_f = feat if self.policy_through_torso else feat.detach()
             src_g = g_vec if self.policy_through_torso else g_vec.detach()
-            feat_c = src_f[pos_idx.to(self.device)]
-            g_c = src_g[pos_idx.to(self.device)]
+            src_fo = feat_opp if self.policy_through_torso else feat_opp.detach()
+            src_go = g_opp if self.policy_through_torso else g_opp.detach()
+            idx = pos_idx.to(dev)
+            pol_mask = is_policy.to(dev)
+            # policy rows read own-perspective features, predict rows the
+            # opponent-perspective ones — each head's inference-time input.
+            # (the other head's nll on a row is weighted 0 below, so the
+            # "wrong" features it sees on those rows contribute nothing)
+            feat_c = torch.where(pol_mask[:, None, None, None],
+                                 src_f[idx], src_fo[idx])
+            g_c = torch.where(pol_mask[:, None], src_g[idx], src_go[idx])
 
             nll_p, ent_p = self.net.policy.plan_nll(
                 feat_c, g_c, plans_t.to(dev), lengths.to(dev),
@@ -295,7 +312,6 @@ class Learner:
                 tm.to(dev), lm.to(dev), cm.to(dev),
             )
             w_t = weights.to(dev)
-            pol_mask = is_policy.to(dev)
             loss_pol = (nll_p * w_t * pol_mask).sum() / max(1, int(pol_mask.sum()))
             loss_pred = (nll_q * (~pol_mask).float()).sum() / max(
                 1, int((~pol_mask).sum()))
@@ -371,6 +387,7 @@ def run_learner(
     max_steps: Optional[int] = None,
     steps_per_1k: Optional[float] = None,
     deadline_ts: Optional[float] = None,
+    server_alive=None,
 ) -> None:
     """Consume trajectories, keep the learner:actor ratio (§6.2), snapshot the
     league every snapshot_interval_min, export weights for hot reload. Sends
@@ -394,6 +411,32 @@ def run_learner(
     weights_path = os.path.join(run_dir, "weights_current.pt")
     reload_s = float(cfg["actors"]["weight_reload_s"])
     snap_s = float(cfg["league"]["snapshot_interval_min"]) * 60.0
+    ckpt_path = os.path.join(run_dir, "checkpoint.pt")
+    ckpt_s = float(cfg["schedule"]["checkpoint_min"]) * 60.0
+
+    # Resume (run.py's phase contract: pilot/main CONTINUE from run_dir). A
+    # fresh Learner here is a random-init net — without this reload its first
+    # export would overwrite the bootstrap/pilot weights_current.pt, and its
+    # empty League would rewrite league.json (anchor flag, snapshot pool, id
+    # counter) on the first loop pass.
+    if os.path.exists(ckpt_path):
+        learner.load_checkpoint(ckpt_path)
+        print("learner: resumed {} at step {}".format(
+            ckpt_path, learner.step_count), flush=True)
+    elif os.path.exists(weights_path):
+        learner.net.load_state_dict(
+            learner.torch.load(weights_path, map_location="cpu"))
+        print("learner: warm-started net from {}".format(weights_path),
+              flush=True)
+    if os.path.exists(league_path):
+        learner.league.load(league_path)
+    if learner.step_count > 0:
+        # re-sync the hot-reload file to the restored checkpoint: after a
+        # crash, weights_current.pt can be up to checkpoint_min NEWER than
+        # checkpoint.pt, and the server was seeded from it — without this the
+        # actors briefly play a "future" net whose steps we are about to redo
+        learner.export_weights(weights_path)
+        control_q.put(("reload", "current", weights_path))
 
     writer = None
     try:
@@ -402,7 +445,7 @@ def run_learner(
     except Exception as exc:
         print("tensorboard writer disabled: {!r}".format(exc), flush=True)
 
-    last_reload = last_snap = time.time()
+    last_reload = last_snap = last_ckpt = time.time()
     steps_owed = 0.0
     recent = deque(maxlen=200)   # (opponent_kind, current_won) rolling window
     games = 0
@@ -413,6 +456,13 @@ def run_learner(
             try:
                 meta, positions = trajectory_q.get(timeout=1.0)
             except Exception:
+                if server_alive is not None and not server_alive():
+                    # dead inference server = every actor stalls on a queue
+                    # that will never answer; without this check a main-phase
+                    # run (no deadline) sits here silently forever
+                    print("learner: inference server died — stopping phase "
+                          "(re-run the same command to resume)", flush=True)
+                    break
                 continue
             learner.ingest(meta, positions)
             steps_owed += ratio * len(positions) / 1000.0
@@ -467,7 +517,19 @@ def run_learner(
                 control_q.put(("load_model", snap_id, snap_path))
                 learner.league.save(league_path)
                 last_snap = now
+            if now - last_ckpt >= ckpt_s and learner.step_count > 0:
+                learner.save_checkpoint(ckpt_path)
+                last_ckpt = now
             learner.league.save(league_path)
     finally:
+        # Phase end (deadline / Ctrl-C / crash): persist net+opt+step and the
+        # league so the next phase resumes exactly here. Writes are atomic
+        # (tmp + os.replace) — a second interrupt leaves the old files intact.
+        try:
+            if learner.step_count > 0:
+                learner.save_checkpoint(ckpt_path)
+                learner.league.save(league_path)
+        except Exception as exc:
+            print("final checkpoint save failed: {!r}".format(exc), flush=True)
         if writer:
             writer.close()

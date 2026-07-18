@@ -22,6 +22,17 @@ import shutil
 import sys
 import time
 
+# Cap BLAS/OpenMP pools BEFORE numpy/torch can start one: libgomp and
+# OpenBLAS size a thread pool per HOST core per process (128 on RunPod hosts
+# regardless of the pod's cpuset), which blows the container's thread limit.
+# This killed the pilot first (126 actors x 128 threads, fixed in phase_loop
+# only) and then bootstrap's learner at its first train_step — the cap must
+# cover EVERY phase, so it lives here at import time, ahead of the numpy
+# import below. Spawned children inherit it via os.environ; setdefault keeps
+# it overridable from the shell.
+for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+
 import numpy as np
 import yaml
 
@@ -83,9 +94,11 @@ class ClientFactory:
 
 def bc_positions_from_corpus(cfg: dict, config: dict, replay_dir: str,
                              limit: int = None):
-    """Replay corpus -> learner-schema positions. Winner sides get their
-    executed plan as the single candidate (pi=1) — the BC prior; loser sides
-    get EMPTY candidates (value/aux/prediction signal only, §13)."""
+    """Replay corpus -> learner-schema positions, YIELDED one list per replay
+    (streaming: the full corpus is tens of GB featurized and must never be
+    materialized in one list). Winner sides get their executed plan as the
+    single candidate (pi=1) — the BC prior; loser sides get EMPTY candidates
+    (value/aux/prediction signal only, §13)."""
     from .replays import build_bc_index, iter_positions, load_game
 
     bc_index = dict(build_bc_index(replay_dir, config,
@@ -93,7 +106,6 @@ def bc_positions_from_corpus(cfg: dict, config: dict, replay_dir: str,
     names = [n for n in sorted(os.listdir(replay_dir)) if n.endswith(".replay")]
     if limit:
         names = names[:limit]
-    out = []
     for name in names:
         path = os.path.join(replay_dir, name)
         rec = load_game(path, config)
@@ -102,6 +114,7 @@ def bc_positions_from_corpus(cfg: dict, config: dict, replay_dir: str,
         bc_side = bc_index.get(path)          # None -> no policy target
         game_positions = list(iter_positions(rec, config))
         by_key = {(p.side, p.turn): p for p in game_positions}
+        out = []
         for p in game_positions:
             opp = by_key.get((1 - p.side, p.turn))
             if opp is None:
@@ -118,7 +131,7 @@ def bc_positions_from_corpus(cfg: dict, config: dict, replay_dir: str,
                 "opp_mp": opp.mp, "opp_plan": opp.plan,
                 "z": p.z, "aux": p.aux,
             })
-    return out
+        yield out
 
 
 def phase_bootstrap(cfg: dict, config: dict, run_dir: str,
@@ -135,11 +148,12 @@ def phase_bootstrap(cfg: dict, config: dict, run_dir: str,
     learner = Learner(cfg, config,
                       device="cuda" if _cuda() else "cpu")
 
-    print("== Stage A: corpus ingestion ==", flush=True)
-    positions = bc_positions_from_corpus(cfg, config, replay_dir)
-    learner.buffer.add_many(positions)
-    print("corpus positions: {}".format(len(positions)), flush=True)
-
+    # Seed games FIRST, corpus SECOND. The buffer is a FIFO capped at
+    # buffer_capacity, and 7,500 seed games alone are ~750K positions — added
+    # after the corpus they silently evicted EVERY corpus position, so BC
+    # trained with zero imitation targets (observed on the pod: loss_policy
+    # exactly 0.0 for all 2,000 bc steps). With the corpus last, the imitation
+    # data survives and whatever seed fraction still fits provides diversity.
     print("== Stage A: scripted seed games (§6.3) ==", flush=True)
     from .scripted import SCRIPTED_BOTS
     names = sorted(SCRIPTED_BOTS.keys())
@@ -157,6 +171,17 @@ def phase_bootstrap(cfg: dict, config: dict, run_dir: str,
         learner.ingest(meta, pos)
         if (i + 1) % 500 == 0:
             print("seed games: {}/{}".format(i + 1, n_seed), flush=True)
+
+    print("== Stage A: corpus ingestion ==", flush=True)
+    n_corpus = 0
+    for chunk in bc_positions_from_corpus(cfg, config, replay_dir):
+        learner.buffer.add_many(chunk)
+        n_corpus += len(chunk)
+    print("corpus positions: {} (buffer now {})".format(
+        n_corpus, len(learner.buffer)), flush=True)
+    if n_corpus == 0:
+        print("WARNING: zero corpus positions — BC will have no imitation "
+              "targets (check replays/scraped/ on this machine)", flush=True)
 
     print("== Stage A: training {} steps ==".format(bc_steps), flush=True)
     for i in range(bc_steps):
@@ -178,6 +203,35 @@ def phase_bootstrap(cfg: dict, config: dict, run_dir: str,
 # Pilot / main — the full loop (§5.5 topology)
 # ---------------------------------------------------------------------------
 
+def _pod_cpus() -> int:
+    """The pod's REAL cpu allocation, in preference order: cgroup CPU quota
+    (what RunPod actually enforces and bills), then cpu affinity, then count.
+    Both os.cpu_count() AND sched_getaffinity report the 128-core HOST inside
+    these containers (observed: 126 actors spawned on a 16-vCPU pod even
+    after the affinity-based fix — the cpuset is simply not restricted).
+    TV_ACTORS in the environment overrides the whole calculation."""
+    try:  # cgroup v1 (the pilot pod's layout)
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") as fh:
+            quota = int(fh.read())
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us") as fh:
+            period = int(fh.read())
+        if quota > 0 and period > 0:
+            return max(1, quota // period)
+    except (OSError, ValueError):
+        pass
+    try:  # cgroup v2
+        with open("/sys/fs/cgroup/cpu.max") as fh:
+            parts = fh.read().split()
+        if len(parts) == 2 and parts[0] != "max":
+            return max(1, int(parts[0]) // int(parts[1]))
+    except (OSError, ValueError):
+        pass
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 2
+
+
 def phase_loop(cfg: dict, config: dict, run_dir: str, hours: float,
                k: int, m: int) -> None:
     import multiprocessing as mp
@@ -187,8 +241,13 @@ def phase_loop(cfg: dict, config: dict, run_dir: str, hours: float,
 
     _require_sim()
     mp.set_start_method("spawn", force=True)
-    n_actors = max(1, (os.cpu_count() or 2) - 2) * \
-        int(cfg["actors"]["per_vcpu"]) // 2
+    # BLAS/OpenMP thread caps are set at module import (top of this file);
+    # spawned actors/server inherit them via os.environ. Actors/server do
+    # tiny per-call numpy ops; 1 BLAS thread each is right.
+    n_actors = int(os.environ.get("TV_ACTORS", "0") or "0")
+    if n_actors <= 0:
+        n_cpu = _pod_cpus()
+        n_actors = max(1, n_cpu - 2) * int(cfg["actors"]["per_vcpu"]) // 2
 
     cfg = json.loads(json.dumps(cfg))          # deep copy; apply phase K/M
     cfg["search"]["k_train"], cfg["search"]["m_train"] = k, m
@@ -246,7 +305,8 @@ def phase_loop(cfg: dict, config: dict, run_dir: str, hours: float,
                     device="cuda" if _cuda() else "cpu",
                     max_steps=None if hours >= 1e6 else
                     int(cfg["learning"]["total_steps"]),
-                    deadline_ts=deadline)
+                    deadline_ts=deadline,
+                    server_alive=server.is_alive)
     finally:
         request_q.put(("stop",))
         for p in actors:
@@ -299,9 +359,52 @@ def phase_package(cfg: dict, config: dict, run_dir: str,
             shutil.copy(src, os.path.join(out_dir, name))
     with open(os.path.join(out_dir, "deploy_config.json"), "w") as fh:
         json.dump(cfg, fh)
+    shipped = []
     for so in glob.glob(os.path.join(_REPO, "sim", "target", "wheels", "*.so")) + \
             glob.glob(os.path.join(_REPO, "sim", "*.so")):
         shutil.copy(so, out_dir)
+        shipped.append(os.path.basename(so))
+    if not shipped:
+        # pod reality: maturin emits a .whl (never a loose .so) and pip installs
+        # the module into site-packages. TWO layouts exist and both are seen in
+        # the wild: a bare terminal_sim.abi3.so, or a package DIRECTORY holding
+        # __init__.py + the .so (what the pilot pod actually has). Ship whichever
+        # is present, preserving `import terminal_sim` next to algo_strategy.py
+        # (rung 1 of the deploy ladder). Shipping only the inner .so out of a
+        # package layout would NOT import — the package dir must go as a unit.
+        try:
+            import terminal_sim as _ts
+            src = getattr(_ts, "__file__", "") or ""
+            if src.endswith(".so"):
+                shutil.copy(src, os.path.join(out_dir, os.path.basename(src)))
+                shipped.append(os.path.basename(src))
+            elif os.path.basename(src) == "__init__.py":
+                pkg = os.path.dirname(src)
+                dst = os.path.join(out_dir, os.path.basename(pkg))
+                shutil.copytree(pkg, dst,
+                                ignore=shutil.ignore_patterns("__pycache__"))
+                # auditwheel/manylinux may park bundled deps in a sibling
+                # <pkg>.libs dir; without it the .so fails to dlopen
+                libs = pkg + ".libs"
+                if os.path.isdir(libs):
+                    shutil.copytree(libs, os.path.join(
+                        out_dir, os.path.basename(libs)))
+                shipped.extend(sorted(
+                    os.path.relpath(p, out_dir) for p in
+                    glob.glob(os.path.join(dst, "**", "*.so"), recursive=True)))
+        except Exception as exc:
+            print("sim bridge copy failed: {!r}".format(exc), flush=True)
+    if shipped:
+        print("sim bridge shipped: {}".format(", ".join(shipped)), flush=True)
+    elif sys.platform.startswith("linux"):
+        raise SystemExit(
+            "no terminal_sim .so found to ship — without it the deployed bot "
+            "silently plays FallbackBot (no search). Run train/setup_runpod.sh "
+            "and package on the pod.")
+    else:
+        print("WARNING: no terminal_sim .so shipped (non-linux packaging box) "
+              "— the deployed bot would fall back to FallbackBot. Package the "
+              "real submission on the pod.", flush=True)
 
     total = sum(os.path.getsize(os.path.join(dp, f))
                 for dp, _dn, fn in os.walk(out_dir) for f in fn)

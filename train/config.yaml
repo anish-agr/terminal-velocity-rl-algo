@@ -56,11 +56,12 @@ search:                      # ARCHITECTURE §5
                              # only (deploy-time sampling; does not affect training)
   tau_opponent: 1.0
   tau_target: 0.25           # §5.3 expert softmax temperature
-  lambda_security: 0.85      # §5.2 expected-case weight; 1-λ on min_j. Raised
-                             # 0.7->0.85: at 0.7 the 30% worst-case penalty made
-                             # the net always pick the all-defense plan (turtle,
-                             # 0 breaches). More weight on expected value -> it
-                             # commits to attacks with good average outcome.
+  lambda_security: 0.75      # §5.2 expected-case weight; 1-λ on min_j. Set to
+                             # 0.75 by the 2026-07-18 self-play tuner (6-config
+                             # duel): best of {0.65..0.95} at +4.7 avg HP vs the
+                             # shipped baseline. Above 0.7 (no turtle collapse)
+                             # but a touch more worst-case weight than 0.85 ->
+                             # slightly more defensive vs scout rushes.
   opponent_weight_temp: 0.5  # w_j ∝ p_j^0.5
   early_exit_v: 0.98         # §5.4 skip widening when winning
   resign_v: -0.97            # §5.4

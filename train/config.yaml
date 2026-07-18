@@ -41,12 +41,19 @@ network:                     # ARCHITECTURE §4
 
 search:                      # ARCHITECTURE §5
   k_train: 12                # own-plan samples (+greedy +all-defense, deduped)
-  k_deploy: 16
+  k_deploy: 8                # capped for the 1-thread deploy box (was 16): the
+                             # full k16/m8 round overran the watchdog on the
+                             # shared ranked server -> FallbackBot every turn
   m_train: 6                 # opponent samples (+literal-previous +empty)
-  m_deploy: 8
+  m_deploy: 4                # was 8, same watchdog reason
   tau_act_start: 1.0         # actor sampling temperature, linear anneal ->
   tau_act_end: 0.7
-  tau_deploy: 0.5
+  tau_deploy: 0.9            # was 0.5: the attack policy mode-collapsed to center
+                             # demolishers at [14,0] (0 breaches, killed at row 12).
+                             # higher temp diversifies the K sampled plans so the
+                             # value head can pick an edge breach; greedy + all-
+                             # defense plans are always included, so this is upside-
+                             # only (deploy-time sampling; does not affect training)
   tau_opponent: 1.0
   tau_target: 0.25           # §5.3 expert softmax temperature
   lambda_security: 0.7       # §5.2 expected-case weight; 1-λ on min_j (tunable)
@@ -115,8 +122,9 @@ cold_start:                  # ARCHITECTURE §6.3 / §13 Stage A
 deployment:                  # ARCHITECTURE §9
   soft_budget_s: 2.5         # p99 target
   watchdog_submit_s: 4.0
-  k_start: 8                 # anytime ladder: double K then M while < soft budget
-  m_start: 4
+  k_start: 4                 # anytime ladder floor (was 8): the mandatory first
+  m_start: 2                 # round must finish under the watchdog on the slow
+                             # shared ranked box, else it falls back every turn
   weights_file: "weights.bin"
   parity_tol: 1.0e-4
   max_folder_mb: 50

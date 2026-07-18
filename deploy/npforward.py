@@ -16,6 +16,14 @@ from __future__ import annotations
 
 import os
 import sys
+
+# Cap BLAS/OpenMP threads before numpy loads (defensive: algo_strategy sets these
+# too, but npforward may be imported first). Uncapped OpenBLAS spawns one thread
+# per host core and dies on the competition container's process limit.
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 from typing import Dict, List, Tuple
 
 import numpy as np

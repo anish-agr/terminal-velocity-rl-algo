@@ -15,6 +15,7 @@ import os
 import queue
 import tempfile
 import threading
+import time
 
 import numpy as np
 
@@ -55,6 +56,7 @@ _CFG = {
     },
     "actors": {"per_vcpu": 2, "infer_batch_max": 64, "infer_batch_wait_ms": 3.0,
                "weight_reload_s": 120, "seeded_start_frac": 0.0},
+    "schedule": {"checkpoint_min": 10},
 }
 
 
@@ -357,6 +359,97 @@ def test_buffer_mirror():
         assert s["board"].shape == (18, 28, 28)
         for plan in s["candidates"]:
             assert plan[-1].type == END
+
+
+def test_predict_head_trains_on_opponent_perspective_features():
+    """search.py feeds the predict head board_opp (opponent-perspective torso
+    output); training must compute its NLL on those same features. If the
+    predict loss instead read the own-perspective features, it would be blind
+    to opp_board entirely — perturbing opp_board must move loss_predict and
+    NOTHING else."""
+    import torch
+
+    meta, positions = _run_one_game()
+
+    def one_step(perturb_opp):
+        torch.manual_seed(0)                     # identical net init both runs
+        learner = Learner(_CFG, _CONFIG, seed=0)  # identical sampling/mirrors
+        pos = [dict(p) for p in positions]
+        if perturb_opp:
+            for p in pos:
+                p["opp_board"] = (p["opp_board"] + 0.5).astype(np.float32)
+        learner.ingest({"opponent_kind": "current", "winner": meta["winner"],
+                        "me": 0}, pos)
+        return learner.train_step()
+
+    base, pert = one_step(False), one_step(True)
+    assert abs(base["loss_value"] - pert["loss_value"]) < 1e-6
+    assert abs(base["loss_policy"] - pert["loss_policy"]) < 1e-6
+    assert abs(base["loss_predict"] - pert["loss_predict"]) > 1e-5, \
+        "predict loss ignored opp_board — trained on the wrong perspective"
+
+
+def test_run_learner_exits_when_server_dies():
+    """A dead inference server stalls every actor forever; the learner (which
+    only sees an empty trajectory queue) must notice and end the phase instead
+    of idling out a no-deadline main run."""
+    from train.learner import run_learner
+
+    cfg = copy.deepcopy(_CFG)
+    with tempfile.TemporaryDirectory() as td:
+        t0 = time.time()
+        run_learner(queue.Queue(), queue.Queue(), cfg, _CONFIG, td,
+                    deadline_ts=time.time() + 60.0,
+                    server_alive=lambda: False)
+        assert time.time() - t0 < 10.0, "did not break out on server death"
+
+
+def test_run_learner_resumes_and_preserves_league():
+    """run_learner must CONTINUE from run_dir (run.py's phase contract):
+    reload checkpoint.pt (net+opt+step), keep league.json's anchor flag /
+    snapshot pool / id counter instead of clobbering them with a fresh
+    League, and write a final checkpoint on exit for the next phase."""
+    import torch
+
+    from train.learner import run_learner
+
+    cfg = copy.deepcopy(_CFG)
+    with tempfile.TemporaryDirectory() as td:
+        boot = Learner(cfg, _CONFIG, seed=0)
+        boot.step_count = 7
+        boot.save_checkpoint(os.path.join(td, "checkpoint.pt"))
+        boot.export_weights(os.path.join(td, "weights_current.pt"))
+        lg = League(cfg)
+        lg.has_anchor = True
+        sid = lg.add_snapshot(os.path.join(td, "snap.pt"))
+        lg.save(os.path.join(td, "league.json"))
+
+        # one real game in the queue (the league.save clobber only runs on
+        # iterations that ingested something), then a ~2 s deadline
+        meta, positions = _run_one_game()
+        tq = queue.Queue()
+        tq.put(({"opponent_kind": "current", "winner": meta["winner"],
+                 "me": 0}, positions))
+        cq = queue.Queue()
+        run_learner(tq, cq, cfg, _CONFIG, td,
+                    deadline_ts=time.time() + 2.0)
+
+        # resume must immediately re-sync the hot-reload weights to the
+        # restored checkpoint (crash can leave weights_current.pt newer)
+        assert cq.get_nowait() == (
+            "reload", "current", os.path.join(td, "weights_current.pt"))
+
+        fresh = Learner(cfg, _CONFIG, seed=1)
+        fresh.load_checkpoint(os.path.join(td, "checkpoint.pt"))
+        assert fresh.step_count == 7                     # step survived
+        for a, b in zip(fresh.net.state_dict().values(),
+                        boot.net.state_dict().values()):
+            assert torch.equal(a, b)                     # BC weights survived
+        lg2 = League(cfg)
+        lg2.load(os.path.join(td, "league.json"))
+        assert lg2.has_anchor                            # flag not clobbered
+        assert [s.id for s in lg2.snapshots] == [sid]    # pool not clobbered
+        assert lg2._counter == 1                         # ids keep counting
 
 
 def main():

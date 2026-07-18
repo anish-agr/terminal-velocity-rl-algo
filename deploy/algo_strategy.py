@@ -27,6 +27,16 @@ import os
 import sys
 import threading
 
+# Cap BLAS/OpenMP threads BEFORE numpy is ever imported (here or in npforward).
+# The competition container is process/thread-restricted; uncapped OpenBLAS tries
+# to spawn one thread per host core, hits RLIMIT_NPROC, and the import/first matmul
+# raises -> the search worker dies every turn -> FallbackBot plays the whole match
+# (looks fine in playground, which has more headroom). setdefault so an explicit
+# env override still wins.
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 for _p in (_HERE, os.path.dirname(_HERE)):
     if _p not in sys.path:
@@ -36,8 +46,12 @@ import gamelib  # noqa: E402
 
 from fallback import AntiRushBot, FallbackBot  # noqa: E402
 
-_SEARCH_BUDGET_S = 2.5
-_WATCHDOG_S = 3.8
+# The shared ranked box runs ~2-4x slower per thread than a dev machine, so the
+# search must self-limit early (budget) and the watchdog needs headroom under
+# the engine's 5s per-turn cap. At 2.5/3.8 the k16/m8 floor round overran every
+# turn and the driver submitted FallbackBot for the whole match.
+_SEARCH_BUDGET_S = 1.6
+_WATCHDOG_S = 4.5
 _STRUCT_KINDS = (0, 1, 2)
 _MOBILE_KINDS = (3, 4, 5)
 

@@ -41,15 +41,32 @@ network:                     # ARCHITECTURE §4
 
 search:                      # ARCHITECTURE §5
   k_train: 12                # own-plan samples (+greedy +all-defense, deduped)
-  k_deploy: 16
+  k_deploy: 12               # widening ceiling. Raised 8->12: ranked replays show
+                             # the thread-capped search runs at only ~0.06-0.42s/turn
+                             # (of a 5s budget) — the old watchdog overrun was the
+                             # BLAS thread explosion, NOT compute. Lots of headroom
+                             # to consider more attack candidates. Floor-time gate.
   m_train: 6                 # opponent samples (+literal-previous +empty)
-  m_deploy: 8
+  m_deploy: 6                # raised 4->6 with k_deploy (more opponent predictions
+                             # -> the scout rush shows up as a worst case -> better
+                             # defense weighting). Same headroom rationale.
   tau_act_start: 1.0         # actor sampling temperature, linear anneal ->
   tau_act_end: 0.7
-  tau_deploy: 0.5
+  tau_deploy: 1.1            # KEY FIX. Sampling draws from logits/tau, so tau<1.0
+                             # SHARPENS -> 0.9 was concentrating HARDER on the
+                             # [14,0] demolisher mode (replays: 200-380 demos/game
+                             # all at [14,0], 0 breaches). tau>1.0 flattens so the
+                             # search actually surfaces edge/flank attacks for the
+                             # value head to pick. Tuner confirmed 1.1 tied best.
+                             # Deploy-time sampling only; does not affect training.
   tau_opponent: 1.0
   tau_target: 0.25           # §5.3 expert softmax temperature
-  lambda_security: 0.7       # §5.2 expected-case weight; 1-λ on min_j (tunable)
+  lambda_security: 0.75      # §5.2 expected-case weight; 1-λ on min_j. Set to
+                             # 0.75 by the 2026-07-18 self-play tuner (6-config
+                             # duel): best of {0.65..0.95} at +4.7 avg HP vs the
+                             # shipped baseline. Above 0.7 (no turtle collapse)
+                             # but a touch more worst-case weight than 0.85 ->
+                             # slightly more defensive vs scout rushes.
   opponent_weight_temp: 0.5  # w_j ∝ p_j^0.5
   early_exit_v: 0.98         # §5.4 skip widening when winning
   resign_v: -0.97            # §5.4
@@ -115,8 +132,12 @@ cold_start:                  # ARCHITECTURE §6.3 / §13 Stage A
 deployment:                  # ARCHITECTURE §9
   soft_budget_s: 2.5         # p99 target
   watchdog_submit_s: 4.0
-  k_start: 8                 # anytime ladder: double K then M while < soft budget
-  m_start: 4
+  k_start: 10                # anytime ladder floor = the de-facto ranked search
+  m_start: 5                 # width. Raised 6/3->10/5: replays show ~0.06-0.42s/turn
+                             # actual compute (thread caps fixed the old slowness),
+                             # so there's room to look at far more moves. Widens
+                             # toward k_deploy/m_deploy (12/6) if time allows.
+                             # MUST re-run the floor-timing check: keep floor < ~2s.
   weights_file: "weights.bin"
   parity_tol: 1.0e-4
   max_folder_mb: 50

@@ -41,19 +41,24 @@ network:                     # ARCHITECTURE §4
 
 search:                      # ARCHITECTURE §5
   k_train: 12                # own-plan samples (+greedy +all-defense, deduped)
-  k_deploy: 8                # capped for the 1-thread deploy box (was 16): the
-                             # full k16/m8 round overran the watchdog on the
-                             # shared ranked server -> FallbackBot every turn
+  k_deploy: 12               # widening ceiling. Raised 8->12: ranked replays show
+                             # the thread-capped search runs at only ~0.06-0.42s/turn
+                             # (of a 5s budget) — the old watchdog overrun was the
+                             # BLAS thread explosion, NOT compute. Lots of headroom
+                             # to consider more attack candidates. Floor-time gate.
   m_train: 6                 # opponent samples (+literal-previous +empty)
-  m_deploy: 4                # was 8, same watchdog reason
+  m_deploy: 6                # raised 4->6 with k_deploy (more opponent predictions
+                             # -> the scout rush shows up as a worst case -> better
+                             # defense weighting). Same headroom rationale.
   tau_act_start: 1.0         # actor sampling temperature, linear anneal ->
   tau_act_end: 0.7
-  tau_deploy: 0.9            # was 0.5: the attack policy mode-collapsed to center
-                             # demolishers at [14,0] (0 breaches, killed at row 12).
-                             # higher temp diversifies the K sampled plans so the
-                             # value head can pick an edge breach; greedy + all-
-                             # defense plans are always included, so this is upside-
-                             # only (deploy-time sampling; does not affect training)
+  tau_deploy: 1.1            # KEY FIX. Sampling draws from logits/tau, so tau<1.0
+                             # SHARPENS -> 0.9 was concentrating HARDER on the
+                             # [14,0] demolisher mode (replays: 200-380 demos/game
+                             # all at [14,0], 0 breaches). tau>1.0 flattens so the
+                             # search actually surfaces edge/flank attacks for the
+                             # value head to pick. Tuner confirmed 1.1 tied best.
+                             # Deploy-time sampling only; does not affect training.
   tau_opponent: 1.0
   tau_target: 0.25           # §5.3 expert softmax temperature
   lambda_security: 0.75      # §5.2 expected-case weight; 1-λ on min_j. Set to
@@ -127,11 +132,12 @@ cold_start:                  # ARCHITECTURE §6.3 / §13 Stage A
 deployment:                  # ARCHITECTURE §9
   soft_budget_s: 2.5         # p99 target
   watchdog_submit_s: 4.0
-  k_start: 6                 # anytime ladder floor. On the slow ranked box the
-  m_start: 3                 # ladder never widens past the floor, so this IS the
-                             # ranked search width. Raised 4/2->6/3 for more attack
-                             # candidates/turn; still fits the watchdog (verify with
-                             # the floor-timing check after packaging).
+  k_start: 10                # anytime ladder floor = the de-facto ranked search
+  m_start: 5                 # width. Raised 6/3->10/5: replays show ~0.06-0.42s/turn
+                             # actual compute (thread caps fixed the old slowness),
+                             # so there's room to look at far more moves. Widens
+                             # toward k_deploy/m_deploy (12/6) if time allows.
+                             # MUST re-run the floor-timing check: keep floor < ~2s.
   weights_file: "weights.bin"
   parity_tol: 1.0e-4
   max_folder_mb: 50

@@ -12,6 +12,8 @@ Per turn under rung 1:
     replay BOTH sides' command logs into a fresh sim -> the mirror state
   - cross-check the mirror's structures against the server's turn frame; on
     mismatch, log and fall back to the scripted plan for this turn
+  - if the anti-rush detector is engaged (opponent is mass-scouting), stage
+    the scripted AntiRushBot counter instead of running the search at all
   - run search.choose with the anytime budget in a worker thread; a watchdog
     submits the FallbackBot plan if the worker misses its deadline
   - stage the chosen commands through gamelib and append them to our log
@@ -32,7 +34,7 @@ for _p in (_HERE, os.path.dirname(_HERE)):
 
 import gamelib  # noqa: E402
 
-from fallback import FallbackBot  # noqa: E402
+from fallback import AntiRushBot, FallbackBot  # noqa: E402
 
 _SEARCH_BUDGET_S = 2.5
 _WATCHDOG_S = 3.8
@@ -49,6 +51,10 @@ class AlgoStrategy(gamelib.AlgoCore):
     def on_game_start(self, config):
         self.config = config
         self.fallback = FallbackBot(config)
+        try:
+            self.antirush = AntiRushBot(config)
+        except Exception:
+            self.antirush = None
         self.our_log = []          # [turn] -> [(kind, x, y), ...] we attempted
         self.enemy_log = []        # [turn] -> reconstructed enemy commands
         self.turn_frames = []      # raw parsed turn-frame dicts
@@ -161,8 +167,26 @@ class AlgoStrategy(gamelib.AlgoCore):
             self.hist_opp.record_turn(
                 own_deploys, self.flow[1], self.flow[0], self.flow[3], self.flow[2])
             self.prev_opp_plan = tuple(decode_commands(enemy_cmds, flip=True))
+            if self.antirush is not None:
+                try:
+                    enemy_mp = float(game_state.get_resource(game_state.MP, 1))
+                except Exception:
+                    enemy_mp = 0.0
+                self.antirush.observe(
+                    sum(1 for s in self.enemy_spawns if s[0] == 3),
+                    sum(1 for s in self.enemy_spawns if s[0] == 4),
+                    sum(1 for s in self.enemy_spawns if s[0] == 5),
+                    self.flow[1], enemy_mp, turn)
         self.enemy_spawns = []
         self.flow = [0.0, 0.0, 0.0, 0.0]
+
+        # anti-rush override (§9.2): while engaged, the scripted counter plays
+        # the turn — no mirror rebuild or search needed, so this path also
+        # rescues games where the mirror has desynced into permanent fallback
+        if self.antirush is not None and self.antirush.engaged:
+            gamelib.debug_write("TV: anti-rush override turn {}".format(turn))
+            self.antirush.apply(game_state)
+            return   # on_turn logs the staged commands for this turn
 
         mirror = self._rebuild_mirror()
         if mirror is None or not self._mirror_in_sync(mirror, frame):

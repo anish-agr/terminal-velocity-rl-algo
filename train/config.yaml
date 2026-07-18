@@ -56,7 +56,11 @@ search:                      # ARCHITECTURE §5
                              # only (deploy-time sampling; does not affect training)
   tau_opponent: 1.0
   tau_target: 0.25           # §5.3 expert softmax temperature
-  lambda_security: 0.7       # §5.2 expected-case weight; 1-λ on min_j (tunable)
+  lambda_security: 0.85      # §5.2 expected-case weight; 1-λ on min_j. Raised
+                             # 0.7->0.85: at 0.7 the 30% worst-case penalty made
+                             # the net always pick the all-defense plan (turtle,
+                             # 0 breaches). More weight on expected value -> it
+                             # commits to attacks with good average outcome.
   opponent_weight_temp: 0.5  # w_j ∝ p_j^0.5
   early_exit_v: 0.98         # §5.4 skip widening when winning
   resign_v: -0.97            # §5.4
@@ -122,9 +126,11 @@ cold_start:                  # ARCHITECTURE §6.3 / §13 Stage A
 deployment:                  # ARCHITECTURE §9
   soft_budget_s: 2.5         # p99 target
   watchdog_submit_s: 4.0
-  k_start: 4                 # anytime ladder floor (was 8): the mandatory first
-  m_start: 2                 # round must finish under the watchdog on the slow
-                             # shared ranked box, else it falls back every turn
+  k_start: 6                 # anytime ladder floor. On the slow ranked box the
+  m_start: 3                 # ladder never widens past the floor, so this IS the
+                             # ranked search width. Raised 4/2->6/3 for more attack
+                             # candidates/turn; still fits the watchdog (verify with
+                             # the floor-timing check after packaging).
   weights_file: "weights.bin"
   parity_tol: 1.0e-4
   max_folder_mb: 50

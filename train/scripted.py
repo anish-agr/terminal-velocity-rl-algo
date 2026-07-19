@@ -328,28 +328,36 @@ def corner_hammer(game, player: int, config: dict) -> List[Command]:
 # those 10 games: this archetype exists in the league so the net is forced to
 # learn both sides of it.
 #
-# The line has one gate cell. On a fixed 6-turn cycle the gate turret is
-# remove-marked (verified: the cell is empty by end of that turn, 75% refund),
-# the wave leaves through the opening next turn, and the gate is rebuilt the
-# turn after. Everything derives from game.turn / live MP -> stateless.
+# Gating matches the real ladder grinders (probe audit of the loss replays):
+# they open their own CORNER — removals of (26,13),(27,13) / (0,13),(1,13)
+# right before each wave — so the wave runs the edge diagonal and pops out
+# directly beside the enemy's corner cell (their breaches landed ON our
+# (0,13)/(27,13)). One removed corner also alternates demo waves with scout
+# waves, and the ramp variant waved every 3 turns; period is 5 here with a
+# strict demo/scout alternation. Everything derives from game.turn / live
+# MP -> stateless. (Removal verified: cell empty by end of the marking turn,
+# 75% refund; wave next turn; rebuilt over the following turns.)
 
-_LG_GATE = (14, 13)
-# corner blocks FIRST — the observed winners stack up to 7 turrets deep at
-# each corner (their breaches against us landed ON our corner cells; theirs
-# never fell). Then the rest of the line, corners inward, gate excluded.
-_LG_CORE = ((0, 13), (27, 13), (1, 13), (26, 13), (1, 12), (26, 12),
-            (2, 13), (25, 13), (2, 12), (25, 12))
+_LG_GATE_R = ((26, 13), (27, 13))   # exit toward the enemy's LEFT corner
+_LG_GATE_L = ((0, 13), (1, 13))     # exit toward the enemy's RIGHT corner
+# corner blocks FIRST — but ONLY on line/interior cells: the edge-diagonal
+# cells below the line ((1,12),(2,11)/(26,12),(25,11)) stay EMPTY so our own
+# gated waves can walk the diagonal to the opened corner (the real grinders'
+# boards have exactly this shape: depth behind the corner, never on the edge)
+_LG_CORE = ((0, 13), (27, 13), (1, 13), (26, 13), (2, 13), (25, 13),
+            (2, 12), (25, 12), (3, 12), (24, 12))
 _LG_LINE = tuple(
     (x, 13) for x in (3, 24, 4, 23, 5, 22, 6, 21, 7, 20,
-                      8, 19, 9, 18, 10, 17, 11, 16, 12, 15, 13)
+                      8, 19, 9, 18, 10, 17, 11, 16, 12, 15, 13, 14)
 )
-_LG_DEEP = ((2, 11), (3, 11), (3, 12), (25, 11), (24, 11), (24, 12))
+_LG_DEEP = ((3, 11), (24, 11), (4, 12), (23, 12))
 # corner turrets upgraded first (16 dmg one-shots scouts at the hot cells);
 # the rest of the line stays base range 4.5 so demolishers can't outrange it
-_LG_UPGRADES = ((0, 13), (1, 13), (26, 13), (27, 13), (1, 12), (26, 12))
+_LG_UPGRADES = ((0, 13), (1, 13), (26, 13), (27, 13), (2, 12), (25, 12))
 _LG_SUPPORTS = ((12, 2), (15, 2))
-_LG_PERIOD = 6           # observed grind cadence: a wave every ~6 turns
+_LG_PERIOD = 5           # real cadence: waves every 3-6 turns (was 6)
 _LG_MIN_DEMOS = 5        # observed first waves: 5-9 demolishers
+_LG_MIN_SCOUTS = 10      # scout-wave floor on alternation cycles
 
 
 def _lg_fill(cmds: List[Command], game, player: int, config: dict) -> None:
@@ -358,7 +366,6 @@ def _lg_fill(cmds: List[Command], game, player: int, config: dict) -> None:
     occ = _occupied(game)
     own = _own_structs(game, player)
     phase = game.turn % _LG_PERIOD
-    gate_abs = to_abs(*_LG_GATE, flip)
 
     res = config.get("resources", {})
     income = float(res.get("bitsPerRound", 5.0))
@@ -366,31 +373,48 @@ def _lg_fill(cmds: List[Command], game, player: int, config: dict) -> None:
     income += float(res.get("bitGrowthRate", 1.0)) * (game.turn // interval)
     decay = float(res.get("bitDecayPerRound", 0.25))
     demo_cost = costs.deploy_mp[1] or 1.0
+    scout_cost = costs.deploy_mp[0] or 1.0
     mp = float(game.stats(player)[2])
+    gate_r = tuple(to_abs(x, y, flip) for (x, y) in _LG_GATE_R)
+    gate_l = tuple(to_abs(x, y, flip) for (x, y) in _LG_GATE_L)
 
-    # -- the gate cycle ------------------------------------------------------
+    # -- the corner-gate cycle -----------------------------------------------
     # NOTE: no "only open when the enemy bank is low" guard — tried and
     # reverted. Against any banking opponent the gate then never opens and
-    # the bot goes fully passive (ties/losses from pure inaction). The brief
-    # opening is adequately covered by the center line turrets; relentless
-    # cadence is what makes this a useful sparring threat.
+    # the bot goes fully passive (ties/losses from pure inaction).
     if phase == _LG_PERIOD - 2:
-        # open the gate only if next turn's bank actually funds a wave
-        if gate_abs in own and \
-                mp * (1.0 - decay) + income >= _LG_MIN_DEMOS * demo_cost:
-            cmds.append((K_REMOVE, gate_abs[0], gate_abs[1]))
+        # open the weaker enemy corner's gate if next turn funds a wave
+        if mp * (1.0 - decay) + income >= _LG_MIN_DEMOS * demo_cost:
+            left_weak = _ch_weak_side_is_their_left(game, player, config, flip)
+            for (ax, ay) in (gate_r if left_weak else gate_l):
+                if (ax, ay) in own:
+                    cmds.append((K_REMOVE, ax, ay))
     elif phase == _LG_PERIOD - 1:
-        if gate_abs not in own:
-            n = int(mp // demo_cost)
-            if n >= _LG_MIN_DEMOS:
-                left = _ch_weak_side_is_their_left(game, player, config, flip)
-                _deploy(cmds, K_DEMOLISHER, (13, 0) if left else (14, 0),
-                        flip, n)
-    else:
-        _emit(cmds, K_TURRET, (_LG_GATE,), flip, occ)   # rebuild the gate
+        # spawn choice keys on which gate is ACTUALLY open (not a re-score,
+        # which could flip sides between the remove turn and the wave turn):
+        # our right corner exit attacks their left corner and vice versa
+        r_open = any(a not in own for a in gate_r)
+        l_open = any(a not in own for a in gate_l)
+        if r_open or l_open:
+            spot = (13, 0) if r_open else (14, 0)
+            if (game.turn // _LG_PERIOD) % 2 == 0:     # demo cycle
+                if mp >= _LG_MIN_DEMOS * demo_cost:
+                    _deploy(cmds, K_DEMOLISHER, spot, flip,
+                            int(mp // demo_cost))
+            else:                                       # scout cycle
+                if mp >= _LG_MIN_SCOUTS * scout_cost:
+                    _deploy(cmds, K_SCOUT, spot, flip,
+                            int(mp // scout_cost))
 
     # -- defense wishlist (engine truncates at the SP line) ------------------
-    _emit(cmds, K_TURRET, _LG_CORE, flip, occ)
+    # while a gate is open (remove + wave turns), keep the gate cells OUT of
+    # the rebuild list or the wave turn would re-block its own exit; they
+    # rebuild over the following three turns of the cycle
+    core = _LG_CORE
+    if phase >= _LG_PERIOD - 2:
+        gates = set(_LG_GATE_R) | set(_LG_GATE_L)
+        core = tuple(c for c in _LG_CORE if c not in gates)
+    _emit(cmds, K_TURRET, core, flip, occ)
     _emit(cmds, K_TURRET, _LG_LINE, flip, occ)
     _upgrades(cmds, game, player, flip, _LG_UPGRADES)
     _emit(cmds, K_TURRET, _LG_DEEP, flip, occ)

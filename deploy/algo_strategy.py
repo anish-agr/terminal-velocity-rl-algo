@@ -69,6 +69,18 @@ _MOBILE_KINDS = (3, 4, 5)
 # without touching the learned policy. Set False to bench the net and run the
 # scripted plan from turn 0 (fallback if the net regresses on the ladder).
 NET_PRIMARY = True
+
+# Mid-game handover: the net keeps the game UNLESS it is clearly failing, at
+# which point CornerHammer (kept warm by observe()/on_action_frame every turn)
+# takes over for the rest of the match. The net dealt 0 breach and lost all 8
+# recent ladder games -- some by turtling to a tie-break loss (15343649 30:30),
+# some outright (15343624 4:30). Trigger AFTER a grace opening on: losing by a
+# clear health margin, OR a no-offense stall (~0 breach dealt while not ahead).
+# Sticky once tripped -- no flip-flopping back to the net.
+_HANDOVER_GRACE_TURNS = 14
+_HANDOVER_HEALTH_GAP = 6.0
+_HANDOVER_STALL_BREACH = 2.0
+
 # The net is far stronger than the scripted fallback (pod arena: 9-0 vs the
 # whole panel, offense connecting, scout_rush +34 / static_maze +36), so the
 # driver's job is to keep the net planning on a CORRECT board every turn.
@@ -123,6 +135,7 @@ class AlgoStrategy(gamelib.AlgoCore):
     def __init__(self):
         super().__init__()
         self.mode = "fallback"
+        self.net_failed = False   # sticky: net handed the game to CornerHammer
 
     # ------------------------------------------------------------------
     def on_game_start(self, config):
@@ -203,8 +216,9 @@ class AlgoStrategy(gamelib.AlgoCore):
     def on_turn(self, turn_state):
         game_state = gamelib.GameState(self.config, turn_state)
         game_state.suppress_warnings(True)
+        self._maybe_hand_over(game_state)
         try:
-            if self.mode == "search":
+            if self.mode == "search" and not self.net_failed:
                 self._search_turn(game_state, turn_state)
             else:
                 self._scripted(game_state)
@@ -222,6 +236,31 @@ class AlgoStrategy(gamelib.AlgoCore):
         if self.mode == "search" and len(self.our_log) < len(self.turn_frames):
             self.our_log.append(self._staged_cmds(game_state))
         game_state.submit_turn()
+
+    def _maybe_hand_over(self, game_state):
+        """Latch the game away from the net to CornerHammer once the net is
+        clearly failing (losing on health, or a no-offense stall). Sticky:
+        the net never gets the game back. CornerHammer's cross-turn state has
+        been kept warm by observe()/on_action_frame every turn, so it takes
+        over mid-match without a cold start."""
+        if self.net_failed or self.mode != "search":
+            return
+        try:
+            turn = int(game_state.turn_number)
+            if turn < _HANDOVER_GRACE_TURNS:
+                return
+            dealt = float(self.flow[0])            # breach WE have dealt
+            my_hp = float(game_state.my_health)
+            opp_hp = float(game_state.enemy_health)
+            losing = (opp_hp - my_hp) >= _HANDOVER_HEALTH_GAP
+            stalled = dealt <= _HANDOVER_STALL_BREACH and my_hp <= opp_hp
+            if losing or stalled:
+                self.net_failed = True
+                gamelib.debug_write(
+                    "TV: net failing t{} dealt={:.0f} hp={:.0f}/{:.0f} "
+                    "-> CornerHammer".format(turn, dealt, my_hp, opp_hp))
+        except Exception:
+            pass
 
     def _scripted(self, game_state):
         """Strongest scripted layer available. corner_hammer is a full

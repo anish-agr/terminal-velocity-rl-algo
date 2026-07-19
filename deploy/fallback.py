@@ -158,6 +158,14 @@ class AntiRushBot:
     #   at 0-0 breaches to turn 99 and lost the coin flip)
     HOLD_DEMOS_MP = 12.0    # in the safe-siege window, bank at which the sally
     #   switches to demolishers — they break the structures scouts bounce off
+    STALL_TURNS = 4         # engaged this many breach-free turns while the
+    #   opponent only banks (never commits a breaching wave) = a STALEMATE our
+    #   standing defense is winning: stop pouring MP into interceptors and push
+    #   instead, so a passive/banking opponent is not handed a tiebreak. Unlike
+    #   safe_siege this does NOT require an empty enemy bank — a bank that never
+    #   breaks through is not a reason to turtle to turn 100 (ladder 15342307:
+    #   640 interceptors, 15 scouts, 0 dmg dealt, lost the coin flip 26-30).
+    #   Self-correcting: any breach resets breach_free and we snap to defense
 
     def __init__(self, config):
         info = config["unitInformation"]
@@ -402,6 +410,10 @@ class AntiRushBot:
             pressure = (self.last_taken > 0 or
                         (shown and
                          enemy_mp >= self.PRESSURE_INCOMES * self.income))
+            # our standing defense has held for STALL_TURNS turns: whatever the
+            # opponent is banking, it is not breaking through, so treat this as
+            # a stalemate to be broken by offense, not defended to a tiebreak
+            holding = self.breach_free >= self.STALL_TURNS
             # interceptor screen sized to that threat, concentrated on the
             # turns a flood is imminent (bank full) and throttled to a token
             # while a proven flooder is refilling — spend follows the flood
@@ -418,7 +430,11 @@ class AntiRushBot:
                         and s not in spots:
                     spots.append(s)
             want = int(threat // self.MP_PER_INTERCEPTOR)
-            if shown and enemy_mp < self.IDLE_BANK_INCOMES * self.income:
+            if holding or (shown and
+                           enemy_mp < self.IDLE_BANK_INCOMES * self.income):
+                # defense holding a stalemate, or a proven flooder between
+                # floods: a big idle bank is not an imminent flood — throttle
+                # the screen to a token and bank the rest for the counterattack
                 want = min(want, self.SCREEN_IDLE_MAX)
             if not sealed:
                 want = max(want, self.SCREEN_MIN_OPEN)
@@ -446,7 +462,10 @@ class AntiRushBot:
             # defense entirely — a refilling flooder still gets the reserve.
             safe_siege = (self.breach_free >= self.HOLD_TURNS and
                           enemy_mp < self.IDLE_BANK_INCOMES * self.income)
-            reserve = 0.0 if safe_siege else \
+            # push in a safe siege OR a held stalemate: both mean our defense
+            # is on top, so commit the banked MP to offense instead of hoarding
+            push_now = safe_siege or holding
+            reserve = 0.0 if push_now else \
                 (self.FLOODER_RESERVE_MP if shown else 0.0)
             if self.gate_open:
                 # the gate was already committed on the prep turn (a ring
@@ -461,7 +480,7 @@ class AntiRushBot:
                 # spends true surplus; a live breach still holds the wave.
                 if self.last_taken == 0 and mp >= self.WAVE_MP + reserve and \
                         self.scout_cost > 0:
-                    if safe_siege and mp >= self.HOLD_DEMOS_MP and \
+                    if push_now and mp >= self.HOLD_DEMOS_MP and \
                             self.demolisher_cost > 0:
                         kind, unit_cost = self.DEMOLISHER, self.demolisher_cost
                     else:
@@ -472,7 +491,7 @@ class AntiRushBot:
                                                      count) or 0) > 0:
                             break
                 self.gate_open = False
-            elif sealed and not pressure and \
+            elif sealed and (holding or not pressure) and \
                     mp >= self.GATE_PREP_MP + reserve:
                 for loc in self.gate:
                     if game_state.contains_stationary_unit(loc):

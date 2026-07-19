@@ -54,6 +54,16 @@ _SEARCH_BUDGET_S = 1.6
 _WATCHDOG_S = 4.5
 _STRUCT_KINDS = (0, 1, 2)
 _MOBILE_KINDS = (3, 4, 5)
+# The net is far stronger than the scripted fallback (pod arena: 9-0 vs the
+# whole panel, offense connecting, scout_rush +34 / static_maze +36). Imperfect
+# opponent-command reconstruction drifts a few structures mid-match and USED to
+# bench the net onto the fallback for the rest of the game (whose counterattack
+# self-destructs in our own funnel: 285/298 units died at y=12, 0 dmg dealt).
+# Tolerate a small structure mismatch so the net keeps planning on a nearly-
+# correct board instead of handing the match to the broken fallback. Exact
+# matches (every desync-free turn, and the whole deterministic arena panel) are
+# unaffected -- diff 0 is always in sync, so the 9-0 panel result is preserved.
+_MIRROR_DRIFT_TOLERANCE = 10
 
 
 class AlgoStrategy(gamelib.AlgoCore):
@@ -315,7 +325,10 @@ class AlgoStrategy(gamelib.AlgoCore):
             return None
 
     def _mirror_in_sync(self, mirror, frame):
-        """Structure position multisets must match the server exactly."""
+        """Structure positions must match the server within a small drift
+        tolerance. Exact match (diff 0) is always in sync; a few drifted cells
+        from imperfect opponent-command reconstruction keep the (much stronger)
+        net playing rather than benching it onto the fallback for the match."""
         try:
             server = set()
             for pid, key in ((0, "p1Units"), (1, "p2Units")):
@@ -324,7 +337,7 @@ class AlgoStrategy(gamelib.AlgoCore):
                     for u in (lists[kind] if kind < len(lists) else []):
                         server.add((kind, pid, int(u[0]), int(u[1])))
             ours = {(s[0], s[1], s[2], s[3]) for s in mirror.structures()}
-            return ours == server
+            return len(ours ^ server) <= _MIRROR_DRIFT_TOLERANCE
         except Exception:
             return False
 

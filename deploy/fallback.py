@@ -76,29 +76,42 @@ class AntiRushBot:
     dropping the screen would be fatal.
     """
 
-    ENTRY_SCOUTS = 8        # scouts in one enemy turn -> flagged (8 MP)
-    ENTRY_DEMOS = 6         # demolishers in one enemy turn -> flagged (12 MP
-    #   at cost 2 — deliberately above the scout bar: modest 4-5 demolisher
-    #   pushes are ordinary play the net should keep handling)
+    # DETECTOR RETUNE (2026-07-18, ranked-replay ms-taken audit): with the
+    # old raw-count entry (8 scouts) and bank triggers (3.0x/2.5x income),
+    # the override engaged by ~turn 11 in 9 of our 10 newest ranked games and
+    # NEVER disengaged — the ladder median wave is ~19 scouts and normal
+    # banking rides the 4x-income decay cap, so ordinary meta play flagged
+    # every window and every held bank stayed "dirty". Measured result: the
+    # net played only 5-9 turns/game; the one game it played fully was our
+    # cleanest win, while the override lost 4 grinder games. Entry is now
+    # income-scaled to true flood size, bank thresholds sit ABOVE the 4x
+    # decay cap (a bank alone neither engages nor holds), and sustain only
+    # marks genuinely large waves so EXIT_CLEAN can actually fire between an
+    # ordinary opponent's waves. The breach-evidence path is unchanged: a
+    # rush that is actually hurting us still engages immediately.
+    ENTRY_WAVE_INCOMES = 4.5   # one enemy wave >= 4.5 turns of income ->
+    #   flagged (income 5 -> 22+ MP: real floods only; the meta's banked
+    #   2.5-4x commit waves stay under this at every income level)
     BREACH_SPIKE = 4.0      # hp lost to breaches in one enemy turn...
     BREACH_MIN_SCOUTS = 5   # ...alongside a real scout wave, or
     BREACH_MIN_DEMOS = 3    # ...a real demolisher wave -> flagged
-    BANK_ENTRY_INCOMES = 3.0   # enemy bank >= 3 turns of income -> flagged
-    #   (a mass-flood rusher banking toward one giant wave is visible for
-    #   many turns before the flood lands — decay caps a bank at 4x income,
-    #   so ordinary save-and-spend cycles stay well below this)
+    BANK_ENTRY_INCOMES = 5.0   # enemy bank -> flagged. Above the 4x-income
+    #   decay cap: unreachable by ordinary banking, only touched by configs
+    #   with weaker decay — banked floods are caught on launch instead
     WIN_MARGIN = 8.0        # cumulative net breach lead at which count/bank
     #   flags are suppressed: an opponent we are out-racing is not a rush,
     #   however many units they field (breach-driven flags stay live)
-    ALERT_WAVE_INCOMES = 1.0   # while ALERTED, a turn spending a full
-    #   turn's income on scouts/demolishers is itself a flag. Pre-hardening
-    #   suppresses the breach evidence (a half-built fortress keeps leaks
-    #   just under BREACH_SPIKE forever), so the follow-up flag must key on
-    #   the opponent's own spend, which our defense cannot mask
-    SUSTAIN_INCOME_FRAC = 0.8  # while engaged, a mobile wave worth this
-    #   fraction of one turn's income is still dirty (cost-scaled, so it
-    #   covers scouts and demolishers alike and ignores late-game dribbles)
-    BANK_HOLD_INCOMES = 2.5    # while engaged, a bank this big is dirty
+    ALERT_WAVE_INCOMES = 3.0   # while ALERTED, a repeat wave must still be
+    #   flood-sized (3x income) to count as the follow-up flag — at the old
+    #   1.0x every ordinary meta wave confirmed the alert
+    SUSTAIN_INCOME_FRAC = 2.5  # while engaged, only a wave this large keeps
+    #   the turn dirty — the wave turn itself, not the quiet turns between
+    #   an ordinary opponent's commits, so the exit can actually fire
+    WAVE_MEMORY_FRAC = 0.8  # separate, unchanged: waves this size still
+    #   update the screen-aim column memory (attack_cols)
+    BANK_HOLD_INCOMES = 5.0    # while engaged, a bank this big is dirty —
+    #   above the decay cap for the same reason as BANK_ENTRY_INCOMES (the
+    #   old 2.5x kept every normal banker's reload "dirty" forever)
     WINDOW = 4              # flag window: floods landing every 3rd turn
     #   (the ladder pattern that engaged 20+ turns late) still meet ENGAGE_OF
     ENGAGE_OF = 2           # engage when >= 2 of the last WINDOW are flagged
@@ -241,15 +254,14 @@ class AntiRushBot:
                 self.hot["left" if x < 10 else
                          ("right" if x > 17 else "center")] += 1.0
             if spawn_xs:   # a real wave: remember its arrival columns
-                if wave_mp >= self.SUSTAIN_INCOME_FRAC * income:
+                if wave_mp >= self.WAVE_MEMORY_FRAC * income:
                     self.attack_cols = sorted(
                         {27 - int(x) for x in spawn_xs})[:3]
             winning = self.total_dealt - self.total_taken >= self.WIN_MARGIN
             hurt = float(breaches_taken) >= self.BREACH_SPIKE and (
                 scouts >= self.BREACH_MIN_SCOUTS or
                 demos >= self.BREACH_MIN_DEMOS)
-            spike = (scouts >= self.ENTRY_SCOUTS
-                     or demos >= self.ENTRY_DEMOS
+            spike = (wave_mp >= self.ENTRY_WAVE_INCOMES * income
                      or float(enemy_mp) >= self.BANK_ENTRY_INCOMES * income
                      or (self.alert and
                          wave_mp >= self.ALERT_WAVE_INCOMES * income))

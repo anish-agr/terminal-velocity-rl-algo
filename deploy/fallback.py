@@ -142,6 +142,15 @@ class AntiRushBot:
     #   surplus after the defensive screen is funded
     WAVE_MP = 10.0          # bank needed to launch a counterattack wave
     GATE_PREP_MP = 7.0      # bank at which the sally gate is marked
+    HOLD_TURNS = 3          # engaged this many breach-free turns = the rush is
+    #   repelled. Combined with a spent enemy bank (they cannot punish an
+    #   aggressive push) this is a SAFE SIEGE window — it can never overlap the
+    #   rush defense because it needs both zero breaches taken AND an empty
+    #   enemy bank. There we drop the counterattack reserve and push
+    #   demolishers instead of banking to a tiebreak loss (ladder 15341198 sat
+    #   at 0-0 breaches to turn 99 and lost the coin flip)
+    HOLD_DEMOS_MP = 12.0    # in the safe-siege window, bank at which the sally
+    #   switches to demolishers — they break the structures scouts bounce off
 
     def __init__(self, config):
         info = config["unitInformation"]
@@ -149,6 +158,7 @@ class AntiRushBot:
         self.SUPPORT = info[1]["shorthand"]
         self.TURRET = info[2]["shorthand"]
         self.SCOUT = info[3]["shorthand"]
+        self.DEMOLISHER = info[4]["shorthand"]
         self.INTERCEPTOR = info[5]["shorthand"]
         self.scout_cost = float(info[3].get("cost2", 1.0))
         self.demolisher_cost = float(info[4].get("cost2", 2.0))
@@ -216,6 +226,7 @@ class AntiRushBot:
         self.income = self.mp_per_round  # refreshed by observe() each turn
         self.threat_mp = 0.0   # decayed memory of the biggest recent wave MP
         self.last_taken = 0.0  # breach hp taken on the last observed turn
+        self.breach_free = 0   # consecutive observed turns taking no breaches
         self.total_dealt = 0.0   # cumulative breach ledger, both directions —
         self.total_taken = 0.0   # a big lead means we are winning, not rushed
         self.hot = {"center": 0.0, "left": 0.0, "right": 0.0}  # breach heat
@@ -247,6 +258,8 @@ class AntiRushBot:
             self.total_dealt += float(breaches_dealt)
             self.total_taken += float(breaches_taken)
             self.last_taken = float(breaches_taken)
+            self.breach_free = 0 if float(breaches_taken) > 0 \
+                else self.breach_free + 1
             for lane in self.hot:
                 self.hot[lane] *= 0.5
             for x in (breach_xs or ()):
@@ -389,14 +402,27 @@ class AntiRushBot:
             mp = game_state.get_resource(self.MP)
             # vs a proven flooder the counterattack must clear an extra
             # reserve on top of the wave cost: offense only from true
-            # surplus once the defensive screen is already funded
-            reserve = self.FLOODER_RESERVE_MP if shown else 0.0
+            # surplus once the defensive screen is already funded. But once
+            # the rush is repelled (breach-free) AND their bank is spent, we
+            # are safe to push hard: drop the reserve and, on a real bank,
+            # siege with demolishers so a held stalemate is not surrendered to
+            # a tiebreak. The empty-bank guard keeps this out of the flooder
+            # defense entirely — a refilling flooder still gets the reserve.
+            safe_siege = (self.breach_free >= self.HOLD_TURNS and
+                          enemy_mp < self.IDLE_BANK_INCOMES * self.income)
+            reserve = 0.0 if safe_siege else \
+                (self.FLOODER_RESERVE_MP if shown else 0.0)
             if self.gate_open:
                 if not pressure and mp >= self.WAVE_MP + reserve and \
                         self.scout_cost > 0:
-                    count = int(mp // self.scout_cost)
+                    if safe_siege and mp >= self.HOLD_DEMOS_MP and \
+                            self.demolisher_cost > 0:
+                        kind, unit_cost = self.DEMOLISHER, self.demolisher_cost
+                    else:
+                        kind, unit_cost = self.SCOUT, self.scout_cost
+                    count = int(mp // unit_cost)
                     for lane in self.counter_lanes:
-                        if (game_state.attempt_spawn(self.SCOUT, [lane],
+                        if (game_state.attempt_spawn(kind, [lane],
                                                      count) or 0) > 0:
                             break
                 self.gate_open = False

@@ -1,4 +1,4 @@
-"""The five scripted league bots (ARCHITECTURE §6.4, §14).
+"""The scripted league bots (ARCHITECTURE §6.4, §14).
 
 Each bot is a PURE function (game, player, config) -> [(kind, x, y), ...]
 absolute engine commands:
@@ -10,6 +10,14 @@ absolute engine commands:
     turtle           interceptor-heavy active defense, scout counter on a bank
     torture          turn-scripted mechanics gauntlet (removals, upgrades,
                      trapped deploys, banking) — a deliberately weird opponent
+    corner_hammer    the ranked-meta distillation (2026-07-18 replay study of
+                     the visible #1 vs the hidden >2000 pool): winners' full
+                     turret line + banked scout waves, plus the corner/flank
+                     hardening and funnel the whole field under-builds
+    line_grinder     the mid-ladder counter-meta (2026-07-18 study of our own
+                     ranked losses): SOLID turret line + gated demolisher
+                     grind waves — the archetype our net lost 4 of 5 ranked
+                     losses to and has no learned answer for
 
 Rules of this module: stateless across turns (anything time-varying derives
 from game.turn), deterministic (no RNG anywhere), every cost read from config,
@@ -22,7 +30,7 @@ from __future__ import annotations
 
 from typing import Callable, Dict, List, Tuple
 
-from .tokens import Costs, to_abs, xy_loc
+from .tokens import Costs, from_abs, to_abs, xy_loc
 
 Command = Tuple[int, int, int]
 
@@ -181,10 +189,233 @@ def torture(game, player: int, config: dict) -> List[Command]:
     return cmds
 
 
+# ---------------------------------------------------------------------------
+# corner_hammer — the ranked-meta distillation (2026-07-18 replay study)
+# ---------------------------------------------------------------------------
+#
+# All layout constants are in perspective space and were extracted from the 19
+# distinct games of the visible #1 seed vs the (hidden) >2000 pool:
+#   * winners run a full turret line across y=13 with corner WALLS at (0,13)/
+#     (27,13), thin y=12 flank backing, and supports shielding the spawn cells;
+#   * winners bank MP to ~0.875 x income/decay (18 MP at 5 income — exactly
+#     full banking from turn 0, reached at turn 7) then commit the whole bank
+#     as one scout wave every 3-8 turns from (13,0)/(14,0) (+ a split stack);
+#   * EVERY defense in the sample — the #1's included — leaks at the corners
+#     (aggregate breach lanes L:231 C:210 R:81, hot cells (0,13),(3,10),(4,9)),
+#     so the corners get the extra turrets + the first upgrades here.
+#
+# Geometry invariant: columns x=13,14 stay COMPLETELY empty on our half so our
+# own waves path straight up and out through the (13,13)/(14,13) gap, while
+# enemy mobiles crossing anywhere must converge into that same gap and run the
+# ring-turret gauntlet down the open column. (The funnel bot above violates
+# this — its ring seals the gap from below — which is left as-is: its value to
+# the league is its defensive shape, not its offense.)
+
+_CH_CORNER_WALLS = ((0, 13), (27, 13))
+_CH_FLANK_TURRETS = ((2, 13), (3, 13), (24, 13), (25, 13), (1, 12), (26, 12))
+_CH_FIRST_UPGRADES = ((2, 13), (25, 13))          # one-shot scouts at each corner
+_CH_RING_TURRETS = ((12, 11), (15, 11), (11, 12), (16, 12))
+# y=13 line fill, corners inward, skipping flankers (built above) and the gap
+_CH_ROW_TURRETS = tuple(
+    (x, 13) for x in (1, 26, 4, 23, 5, 22, 6, 21, 7, 20,
+                      8, 19, 9, 18, 10, 17, 11, 16, 12, 15)
+)
+_CH_BACK_TURRETS = ((2, 12), (25, 12), (5, 12), (22, 12), (8, 12), (19, 12))
+_CH_SUPPORTS = ((12, 2), (15, 2), (11, 3), (16, 3))
+# late-game SP sink: upgrade every other line turret; odd-x turrets stay at
+# base range (4.5) so demolishers (range 4.5) can never outrange the whole
+# line once upgrades (range 3.5) land
+_CH_LATE_UPGRADES = tuple((x, 13) for x in (4, 6, 8, 10, 12, 15, 17, 19, 21, 23))
+# corner-zone bounds for the lane pick (enemy half, perspective space)
+_CH_ZONE_Y = (14, 20)
+_CH_ZONE_A_XMIN = 21      # their LEFT corner shows up top-right for us
+_CH_ZONE_B_XMAX = 6       # their RIGHT corner, top-left for us
+
+
+def _ch_weak_side_is_their_left(game, player: int, config: dict,
+                                flip: bool) -> bool:
+    """Score the two enemy corner zones by defensive strength (turret damage,
+    upgrade-aware, plus wall presence) and aim at the weaker one. Tie -> their
+    left, the hottest leak lane in the ranked sample. Stateless: re-reads the
+    live board every turn, so it re-aims as their defense shifts."""
+    info = config["unitInformation"]
+    t_dmg = float(info[K_TURRET].get("attackDamageWalker", 0.0))
+    t_dmg_up = float(info[K_TURRET].get("upgrade", {})
+                     .get("attackDamageWalker", t_dmg))
+    wall_hp = float(info[K_WALL].get("startHealth", 1.0)) or 1.0
+    a = b = 0.0
+    for s in game.structures():
+        if s[1] == player:
+            continue
+        px, py = from_abs(s[2], s[3], flip)
+        if not (_CH_ZONE_Y[0] <= py <= _CH_ZONE_Y[1]):
+            continue
+        kind = s[0]
+        if kind == K_TURRET:
+            val = t_dmg_up if s[5] else t_dmg
+        elif kind == K_WALL:
+            val = s[4] / wall_hp
+        else:
+            continue
+        if px >= _CH_ZONE_A_XMIN:
+            a += val
+        elif px <= _CH_ZONE_B_XMAX:
+            b += val
+    return a <= b
+
+
+def _ch_fill(cmds: List[Command], game, player: int, config: dict) -> None:
+    costs = Costs(config)
+    flip = player == 1
+    occ = _occupied(game)
+
+    # -- defense wishlist, priority order (engine truncates at the SP line) --
+    _emit(cmds, K_WALL, _CH_CORNER_WALLS, flip, occ)
+    _upgrades(cmds, game, player, flip, _CH_CORNER_WALLS)   # 120 HP for 1 SP
+    _emit(cmds, K_TURRET, _CH_FLANK_TURRETS, flip, occ)
+    _upgrades(cmds, game, player, flip, _CH_FIRST_UPGRADES)
+    _emit(cmds, K_TURRET, _CH_RING_TURRETS, flip, occ)
+    _emit(cmds, K_TURRET, _CH_ROW_TURRETS, flip, occ)
+    _upgrades(cmds, game, player, flip, _CH_FLANK_TURRETS)
+    _emit(cmds, K_TURRET, _CH_BACK_TURRETS, flip, occ)
+    _emit(cmds, K_SUPPORT, _CH_SUPPORTS, flip, occ)
+    _upgrades(cmds, game, player, flip, _CH_SUPPORTS)
+    _upgrades(cmds, game, player, flip, _CH_LATE_UPGRADES)
+
+    # -- offense: bank everything, commit the whole bank as one wave ---------
+    res = config.get("resources", {})
+    income = float(res.get("bitsPerRound", 5.0))
+    interval = int(res.get("turnIntervalForBitSchedule", 10)) or 10
+    income += float(res.get("bitGrowthRate", 1.0)) * (game.turn // interval)
+    decay = float(res.get("bitDecayPerRound", 0.25)) or 0.25
+    threshold = 0.875 * income / decay      # winners' observed commit point
+
+    mp = float(game.stats(player)[2])
+    scout_cost = costs.deploy_mp[0]
+    if mp >= threshold and scout_cost > 0:
+        n = int(mp // scout_cost)
+        left = _ch_weak_side_is_their_left(game, player, config, flip)
+        deep, split = ((13, 0), (11, 2)) if left else ((14, 0), (16, 2))
+        n_split = n // 4 if n >= 12 else 0  # trailing second stack, winners' ratio
+        _deploy(cmds, K_SCOUT, deep, flip, n - n_split)
+        if n_split:
+            _deploy(cmds, K_SCOUT, split, flip, n_split)
+
+
+def corner_hammer(game, player: int, config: dict) -> List[Command]:
+    """Winners' line + banked scout waves + the corner hardening and funnel
+    the entire ranked field under-builds. Never raises: whatever was staged
+    before a failure is still a legal wishlist."""
+    cmds: List[Command] = []
+    try:
+        _ch_fill(cmds, game, player, config)
+    except Exception:
+        pass
+    return cmds
+
+
+# ---------------------------------------------------------------------------
+# line_grinder — the mid-ladder counter-meta (2026-07-18 ranked-loss study)
+# ---------------------------------------------------------------------------
+#
+# Distilled from the three opponents that beat our deployed net with the same
+# plan (replays 23-0-3 / 23-0-9 / 23-1-43): a COMPLETELY solid turret line
+# across y=13 (27-35 turrets, no walls, no gap — scout waves of any size
+# scored zero breaches against it all game), attacking ONLY with banked
+# demolisher waves (9-16 at a time, every ~6 turns) that outrange upgraded
+# turrets (4.5 vs 3.5) and ground our corner cells open — their breaches
+# landed ON (0,13)/(27,13) themselves. Our net played 0 demolishers in 9 of
+# those 10 games: this archetype exists in the league so the net is forced to
+# learn both sides of it.
+#
+# The line has one gate cell. On a fixed 6-turn cycle the gate turret is
+# remove-marked (verified: the cell is empty by end of that turn, 75% refund),
+# the wave leaves through the opening next turn, and the gate is rebuilt the
+# turn after. Everything derives from game.turn / live MP -> stateless.
+
+_LG_GATE = (14, 13)
+# corner blocks FIRST — the observed winners stack up to 7 turrets deep at
+# each corner (their breaches against us landed ON our corner cells; theirs
+# never fell). Then the rest of the line, corners inward, gate excluded.
+_LG_CORE = ((0, 13), (27, 13), (1, 13), (26, 13), (1, 12), (26, 12),
+            (2, 13), (25, 13), (2, 12), (25, 12))
+_LG_LINE = tuple(
+    (x, 13) for x in (3, 24, 4, 23, 5, 22, 6, 21, 7, 20,
+                      8, 19, 9, 18, 10, 17, 11, 16, 12, 15, 13)
+)
+_LG_DEEP = ((2, 11), (3, 11), (3, 12), (25, 11), (24, 11), (24, 12))
+# corner turrets upgraded first (16 dmg one-shots scouts at the hot cells);
+# the rest of the line stays base range 4.5 so demolishers can't outrange it
+_LG_UPGRADES = ((0, 13), (1, 13), (26, 13), (27, 13), (1, 12), (26, 12))
+_LG_SUPPORTS = ((12, 2), (15, 2))
+_LG_PERIOD = 6           # observed grind cadence: a wave every ~6 turns
+_LG_MIN_DEMOS = 5        # observed first waves: 5-9 demolishers
+
+
+def _lg_fill(cmds: List[Command], game, player: int, config: dict) -> None:
+    costs = Costs(config)
+    flip = player == 1
+    occ = _occupied(game)
+    own = _own_structs(game, player)
+    phase = game.turn % _LG_PERIOD
+    gate_abs = to_abs(*_LG_GATE, flip)
+
+    res = config.get("resources", {})
+    income = float(res.get("bitsPerRound", 5.0))
+    interval = int(res.get("turnIntervalForBitSchedule", 10)) or 10
+    income += float(res.get("bitGrowthRate", 1.0)) * (game.turn // interval)
+    decay = float(res.get("bitDecayPerRound", 0.25))
+    demo_cost = costs.deploy_mp[1] or 1.0
+    mp = float(game.stats(player)[2])
+
+    # -- the gate cycle ------------------------------------------------------
+    # NOTE: no "only open when the enemy bank is low" guard — tried and
+    # reverted. Against any banking opponent the gate then never opens and
+    # the bot goes fully passive (ties/losses from pure inaction). The brief
+    # opening is adequately covered by the center line turrets; relentless
+    # cadence is what makes this a useful sparring threat.
+    if phase == _LG_PERIOD - 2:
+        # open the gate only if next turn's bank actually funds a wave
+        if gate_abs in own and \
+                mp * (1.0 - decay) + income >= _LG_MIN_DEMOS * demo_cost:
+            cmds.append((K_REMOVE, gate_abs[0], gate_abs[1]))
+    elif phase == _LG_PERIOD - 1:
+        if gate_abs not in own:
+            n = int(mp // demo_cost)
+            if n >= _LG_MIN_DEMOS:
+                left = _ch_weak_side_is_their_left(game, player, config, flip)
+                _deploy(cmds, K_DEMOLISHER, (13, 0) if left else (14, 0),
+                        flip, n)
+    else:
+        _emit(cmds, K_TURRET, (_LG_GATE,), flip, occ)   # rebuild the gate
+
+    # -- defense wishlist (engine truncates at the SP line) ------------------
+    _emit(cmds, K_TURRET, _LG_CORE, flip, occ)
+    _emit(cmds, K_TURRET, _LG_LINE, flip, occ)
+    _upgrades(cmds, game, player, flip, _LG_UPGRADES)
+    _emit(cmds, K_TURRET, _LG_DEEP, flip, occ)
+    _emit(cmds, K_SUPPORT, _LG_SUPPORTS, flip, occ)
+    _upgrades(cmds, game, player, flip, _LG_SUPPORTS)
+
+
+def line_grinder(game, player: int, config: dict) -> List[Command]:
+    """Solid turret line + gated demolisher grind — the archetype behind 4 of
+    our 5 newest ranked losses. Never raises: whatever was staged before a
+    failure is still a legal wishlist."""
+    cmds: List[Command] = []
+    try:
+        _lg_fill(cmds, game, player, config)
+    except Exception:
+        pass
+    return cmds
+
+
 SCRIPTED_BOTS: Dict[str, Callable] = {
     "rush": rush,
     "funnel": funnel,
     "demolisher_line": demolisher_line,
     "turtle": turtle,
     "torture": torture,
+    "corner_hammer": corner_hammer,
+    "line_grinder": line_grinder,
 }

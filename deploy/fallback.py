@@ -397,16 +397,19 @@ class AntiRushBot:
             out += seg[lane]
         return out
 
-    def _best_lane(self, game_state, wave_hp):
+    def _best_lane(self, game_state, wave_hp, desperate=False):
         """Least-defended counterattack spawn cell by REAL gamelib pathing.
 
         Scores each free candidate by the number of enemy attackers covering
         every step of the exact path gamelib predicts. Lanes whose path
         dead-ends on our half would feed the wave to our own funnel (ladder
         15342407: 285/298 demolishers died at y<=12 for 0 damage), so they
-        are skipped; if even the best lane's projected damage exceeds
-        SUICIDE_RATIO x the wave's total hp, returns None and the caller
-        keeps the MP banked. Never raises."""
+        are ALWAYS skipped. When not `desperate`, a lane whose projected
+        damage exceeds SUICIDE_RATIO x the wave's hp returns None so the
+        caller banks the MP for a bigger wave. When `desperate` (a stalemate
+        we are LOSING -- holding just donates the health tiebreak, ladder
+        15343245: 0 dmg dealt, lost 24:30) the least-defended reaching lane
+        is returned regardless, to grind their structures. Never raises."""
         best, best_danger = None, None
         for lane in self.counter_lanes:
             try:
@@ -426,7 +429,8 @@ class AntiRushBot:
                 best, best_danger = lane, danger
         if best is None:
             return None
-        if best_danger * self.TURRET_DMG_EST > wave_hp * self.SUICIDE_RATIO:
+        if not desperate and \
+                best_danger * self.TURRET_DMG_EST > wave_hp * self.SUICIDE_RATIO:
             return None
         return best
 
@@ -579,9 +583,14 @@ class AntiRushBot:
                         kind, unit_cost, unit_hp = (
                             self.SCOUT, self.scout_cost, self.scout_hp)
                     count = int(mp // unit_cost)
-                    # fire down the least-defended REAL path; hold the bank
-                    # instead of feeding a hopeless lane
-                    lane = self._best_lane(game_state, count * unit_hp)
+                    # fire down the least-defended REAL path; normally hold the
+                    # bank instead of feeding a hopeless lane, BUT if we are
+                    # holding a stalemate we are LOSING on the breach ledger,
+                    # grind anyway -- banking to turn 100 just donates the
+                    # health tiebreak
+                    desperate = holding and self.total_taken > self.total_dealt
+                    lane = self._best_lane(game_state, count * unit_hp,
+                                           desperate=desperate)
                     if lane is not None:
                         game_state.attempt_spawn(kind, [lane], count)
                 self.gate_open = False

@@ -59,6 +59,16 @@ _SEARCH_BUDGET_S = 1.6
 _WATCHDOG_S = 4.5
 _STRUCT_KINDS = (0, 1, 2)
 _MOBILE_KINDS = (3, 4, 5)
+
+# Primary strategy switch. The neural-net search LOSES real ladder games: it
+# sprays ~30 turrets with almost no walls, dribbles offense into interior /
+# self-trapping cells, and deals ~0 breach (ladder 15343406/16/26/32 = 0-4,
+# offense dying in OUR half, 3/1/0/0 damage dealt). It cannot be validated
+# locally (no engine / .so here). CornerHammerBot is the proven ~1400-1500
+# standalone ladder bot. Until the net is fixed AND verified on a real box,
+# run the proven scripted plan from turn 0 instead of benching it only on a
+# desync/watchdog miss. Flip back to True once the net is trustworthy.
+NET_PRIMARY = False
 # The net is far stronger than the scripted fallback (pod arena: 9-0 vs the
 # whole panel, offense connecting, scout_rush +34 / static_maze +36), so the
 # driver's job is to keep the net planning on a CORRECT board every turn.
@@ -153,8 +163,14 @@ class AlgoStrategy(gamelib.AlgoCore):
             with open(os.path.join(_HERE, "deploy_config.json")) as fh:
                 self.cfg = json.load(fh)
             self.prev_opp_plan = None
-            self.mode = "search"
-            gamelib.debug_write("TV: full search mode")
+            if NET_PRIMARY:
+                self.mode = "search"
+                gamelib.debug_write("TV: full search mode")
+            else:
+                # net loaded but benched (it loses real ladder games) --
+                # play the proven CornerHammer plan every turn instead
+                self.mode = "corner_hammer"
+                gamelib.debug_write("TV: corner_hammer primary (net benched)")
         except Exception as exc:
             gamelib.debug_write("TV: fallback mode ({!r})".format(exc))
 

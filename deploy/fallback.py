@@ -47,11 +47,14 @@ class FallbackBot:
 
 
 class AntiRushBot:
-    """Mass-scout-rush detector + scripted counter for the deployment driver.
+    """Mobile-rush detector + scripted counter for the deployment driver.
 
-    The driver feeds observe() one completed enemy turn at a time (scouts /
-    demolishers / interceptors deployed, hp lost to breaches, enemy MP bank)
-    and, while `engaged`, plays apply() instead of running the net search.
+    Covers both rush archetypes seen on ladder: mass scouts and mass
+    demolishers (thresholds are cost-scaled, so a demolisher wave counts
+    with double weight per unit). The driver feeds observe() one completed
+    enemy turn at a time (scouts / demolishers / interceptors deployed, hp
+    lost to breaches and where, hp we breached, enemy MP bank) and, while
+    `engaged`, plays apply() instead of running the net search.
     The counter combines the FallbackBot funnel (a sealed wall row whose only
     opening feeds a turret ring — scouts cannot leak around it) with
     train/scripted.py::turtle's active pieces rewritten against the gamelib
@@ -63,25 +66,57 @@ class AntiRushBot:
 
     Hysteresis is Schmitt-trigger style so one noisy turn never flips the
     mode in either direction. ENTRY: >= ENGAGE_OF of the last WINDOW turns
-    flagged (a big scout wave, or heavy breaches from a scout-dominant mix).
-    EXIT: EXIT_CLEAN consecutive clean turns — and while engaged a turn stays
-    dirty on a smaller sustained scout wave or a large enemy MP bank, because
-    a rusher reloading between floods looks quiet exactly when dropping the
-    screen would be fatal.
+    flagged (a big scout or demolisher wave, heavy breaches taken alongside
+    a real wave, or an enemy bank several turns of income deep) — count and
+    bank flags are suppressed while we hold a large breach lead, so an
+    opponent the net is out-racing never benches the net. EXIT: EXIT_CLEAN
+    consecutive clean turns — and while engaged a turn stays dirty on a
+    sustained mobile wave (cost-scaled vs income) or a large enemy MP bank,
+    because a rusher reloading between floods looks quiet exactly when
+    dropping the screen would be fatal.
     """
 
-    ENTRY_SCOUTS = 8        # scouts in one enemy turn -> flagged
-    BREACH_SPIKE = 4.0      # hp lost in one turn with a scout-dominant mix...
-    BREACH_MIN_SCOUTS = 5   # ...but only alongside a real scout wave
-    BANK_ENTRY_INCOMES = 3.5   # enemy bank >= 3.5 turns of income -> flagged
-    #   (a mass-flood rusher banking toward one giant wave is visible for many
-    #   turns before the flood lands — decay caps a bank at 4x income, so 3.5x
-    #   only ever flags deliberate max-banking, never save-and-spend cycles)
-    SUSTAIN_SCOUTS = 4      # while engaged, this many scouts is still dirty
+    ENTRY_SCOUTS = 8        # scouts in one enemy turn -> flagged (8 MP)
+    ENTRY_DEMOS = 6         # demolishers in one enemy turn -> flagged (12 MP
+    #   at cost 2 — deliberately above the scout bar: modest 4-5 demolisher
+    #   pushes are ordinary play the net should keep handling)
+    BREACH_SPIKE = 4.0      # hp lost to breaches in one enemy turn...
+    BREACH_MIN_SCOUTS = 5   # ...alongside a real scout wave, or
+    BREACH_MIN_DEMOS = 3    # ...a real demolisher wave -> flagged
+    BANK_ENTRY_INCOMES = 3.0   # enemy bank >= 3 turns of income -> flagged
+    #   (a mass-flood rusher banking toward one giant wave is visible for
+    #   many turns before the flood lands — decay caps a bank at 4x income,
+    #   so ordinary save-and-spend cycles stay well below this)
+    WIN_MARGIN = 8.0        # cumulative net breach lead at which count/bank
+    #   flags are suppressed: an opponent we are out-racing is not a rush,
+    #   however many units they field (breach-driven flags stay live)
+    SUSTAIN_INCOME_FRAC = 0.8  # while engaged, a mobile wave worth this
+    #   fraction of one turn's income is still dirty (cost-scaled, so it
+    #   covers scouts and demolishers alike and ignores late-game dribbles)
     BANK_HOLD_INCOMES = 2.5    # while engaged, a bank this big is dirty
-    WINDOW = 3
+    WINDOW = 4              # flag window: floods landing every 3rd turn
+    #   (the ladder pattern that engaged 20+ turns late) still meet ENGAGE_OF
     ENGAGE_OF = 2           # engage when >= 2 of the last WINDOW are flagged
     EXIT_CLEAN = 3          # disengage after this many consecutive clean turns
+    THREAT_DECAY = 0.75     # per-turn fade of the remembered attack size
+    THREAT_AFTERGLOW = 0.5  # weight of that memory in screen sizing — small
+    #   insurance right after a flood without starving the counterattack
+    MP_PER_INTERCEPTOR = 5.0   # screen sizing: one interceptor per ~5 MP of
+    #   measured threat (a 40-hp interceptor one-shots 5-hp demolishers and
+    #   trades into several scouts)
+    SCREEN_MIN_OPEN = 3     # screen floor while the wall line is unsealed
+    SCREEN_CAP = 12         # sanity cap on one turn's screen
+    PRESSURE_INCOMES = 2.0  # enemy BANK >= 2 turns of income, or breaches
+    #   taken last turn -> defense first: no sally prep, no counterattack.
+    #   Deliberately keyed on the current bank, not the remembered wave: the
+    #   turns right after a flood (their bank is empty) are exactly when a
+    #   counterattack is safe — and the only way to win the hp race
+    SHOWN_WAVE_INCOMES = 1.0   # a wave worth one turn's income proves the
+    #   opponent actually floods. Until then a big bank is hypothetical: it
+    #   gets a token screen and never suppresses our counterattack — an idle
+    #   bank must not bleed us dry on interceptors (ladder 15340295)
+    WAVE_MP = 10.0          # bank needed to launch a counterattack wave
+    GATE_PREP_MP = 7.0      # bank at which the sally gate is marked
 
     def __init__(self, config):
         info = config["unitInformation"]
@@ -91,6 +126,7 @@ class AntiRushBot:
         self.SCOUT = info[3]["shorthand"]
         self.INTERCEPTOR = info[5]["shorthand"]
         self.scout_cost = float(info[3].get("cost2", 1.0))
+        self.demolisher_cost = float(info[4].get("cost2", 2.0))
         self.interceptor_cost = float(info[5].get("cost2", 1.0))
         self.MP = 1
         res = config.get("resources", {})
@@ -120,6 +156,14 @@ class AntiRushBot:
         self.lane_clear = [[13, y] for y in range(11)] + \
                           [[14, y] for y in range(11)]
         self.upgrade_first = [[12, 13], [15, 13], [11, 13], [16, 13]]
+        # upgrade groups per lane so apply() can harden whichever lane the
+        # opponent is actually breaching first (hot-lane priority)
+        self.lane_upgrades = {
+            "center": self.upgrade_first + [[13, 11], [14, 11], [12, 12],
+                                            [15, 12], [11, 11], [16, 11]],
+            "left": [[3, 12], [0, 13], [1, 13], [2, 13], [3, 13]],
+            "right": [[24, 12], [27, 13], [26, 13], [25, 13], [24, 13]],
+        }
         # shield pylons flanking the counterattack lane (x 13/14): upgraded
         # supports roughly double a scout's effective hp, which is what lets
         # a counter wave survive the turrets guarding the funnel exit
@@ -135,27 +179,51 @@ class AntiRushBot:
         self.clean = 0         # consecutive clean turns
         self.engaged = False
         self.gate_open = False  # gate turret marked last turn: wave turn
+        self.income = self.mp_per_round  # refreshed by observe() each turn
+        self.threat_mp = 0.0   # decayed memory of the biggest recent wave MP
+        self.last_taken = 0.0  # breach hp taken on the last observed turn
+        self.total_dealt = 0.0   # cumulative breach ledger, both directions —
+        self.total_taken = 0.0   # a big lead means we are winning, not rushed
+        self.hot = {"center": 0.0, "left": 0.0, "right": 0.0}  # breach heat
 
     def observe(self, scouts, demolishers, interceptors, breaches_taken,
-                enemy_mp=0.0, turn=0):
+                enemy_mp=0.0, turn=0, breaches_dealt=0.0, breach_xs=None):
         """Ingest one completed enemy turn; returns `engaged`. Never raises.
 
         Bank thresholds scale with the per-turn MP income (which grows over
         the match) — a static cutoff would eventually flag every opponent's
-        ordinary working balance and lock the counter in permanently.
+        ordinary working balance and lock the counter in permanently. Count
+        and bank flags are suppressed while we hold a big cumulative breach
+        lead (we are out-racing them — not a rush we need to turtle against),
+        but flags driven by breaches WE take always stay live.
         """
         try:
             scouts = int(scouts)
+            demos = int(demolishers)
             income = self.mp_per_round + \
                 self.mp_growth * (int(turn) // self.mp_interval)
-            scout_dominant = scouts > int(demolishers) + int(interceptors)
-            entry = (scouts >= self.ENTRY_SCOUTS
-                     or (float(breaches_taken) >= self.BREACH_SPIKE
-                         and scout_dominant
-                         and scouts >= self.BREACH_MIN_SCOUTS)
+            self.income = income
+            wave_mp = scouts * self.scout_cost + demos * self.demolisher_cost
+            self.threat_mp = max(wave_mp, self.threat_mp * self.THREAT_DECAY)
+            self.total_dealt += float(breaches_dealt)
+            self.total_taken += float(breaches_taken)
+            self.last_taken = float(breaches_taken)
+            for lane in self.hot:
+                self.hot[lane] *= 0.5
+            for x in (breach_xs or ()):
+                x = int(x)
+                self.hot["left" if x < 10 else
+                         ("right" if x > 17 else "center")] += 1.0
+            winning = self.total_dealt - self.total_taken >= self.WIN_MARGIN
+            hurt = float(breaches_taken) >= self.BREACH_SPIKE and (
+                scouts >= self.BREACH_MIN_SCOUTS or
+                demos >= self.BREACH_MIN_DEMOS)
+            spike = (scouts >= self.ENTRY_SCOUTS
+                     or demos >= self.ENTRY_DEMOS
                      or float(enemy_mp) >= self.BANK_ENTRY_INCOMES * income)
+            entry = hurt or (spike and not winning)
             dirty = entry or (self.engaged and (
-                scouts >= self.SUSTAIN_SCOUTS or
+                wave_mp >= self.SUSTAIN_INCOME_FRAC * income or
                 float(enemy_mp) >= self.BANK_HOLD_INCOMES * income))
             self.flags.append(bool(entry))
             del self.flags[:-self.WINDOW]
@@ -191,20 +259,44 @@ class AntiRushBot:
             sealed = missing <= 2
             if sealed:   # shield pylons only once the seal is paid for
                 game_state.attempt_spawn(self.SUPPORT, self.supports)
-            game_state.attempt_upgrade(self.upgrade_first + self.supports +
+            # hot-lane priority: upgrade the lane actually being breached
+            # first (gamelib skips already-upgraded cells, so repeats are
+            # free); ties keep the center-first default order
+            lanes = ("center", "left", "right")
+            upgrades = []
+            for lane in sorted(lanes, key=lambda l: (-self.hot.get(l, 0.0),
+                                                     lanes.index(l))):
+                upgrades += self.lane_upgrades.get(lane, [])
+            game_state.attempt_upgrade(upgrades + self.supports +
                                        self.turrets + self.walls)
             mp = game_state.get_resource(self.MP)
             try:
                 enemy_mp = float(game_state.get_resource(self.MP, 1))
             except Exception:
                 enemy_mp = 0.0
-            # interceptor screen: while the funnel is open, keep bodies in the
-            # lanes every turn; once sealed, spend only to pre-empt a visible
-            # banked flood (one interceptor per ~6 MP banked), capped, never
-            # overdrawn — skipping screen spots blocked by earlier builds
+            # measured threat: the bank they could throw right now, floored
+            # by an afterglow of the biggest recent wave — but an opponent
+            # who has never shown a real wave only ever gets a token screen,
+            # however big their idle bank. Pressure — a proven flooder's
+            # bank worth a real flood, or breaches taken last turn — sends
+            # every MP to defense; the post-flood turns (bank spent) are the
+            # sally window.
+            shown = self.threat_mp >= self.SHOWN_WAVE_INCOMES * self.income
+            threat = max(enemy_mp if shown else min(enemy_mp, self.income),
+                         self.threat_mp * self.THREAT_AFTERGLOW)
+            pressure = (self.last_taken > 0 or
+                        (shown and
+                         enemy_mp >= self.PRESSURE_INCOMES * self.income))
+            # interceptor screen sized to that threat and sustained while it
+            # persists (the memory decays over ~4-5 turns), with a floor
+            # while the wall is still going up and a sanity cap — never a
+            # flat max, so a quiet opponent gets a near-zero screen
             spots = [s for s in self.screens
                      if not game_state.contains_stationary_unit(s)]
-            want = min((0 if sealed else 3) + int(enemy_mp // 6.0), 9)
+            want = int(threat // self.MP_PER_INTERCEPTOR)
+            if not sealed:
+                want = max(want, self.SCREEN_MIN_OPEN)
+            want = min(want, self.SCREEN_CAP)
             n = min(want, int(mp // self.interceptor_cost)) \
                 if (spots and self.interceptor_cost > 0) else 0
             for i in range(n):
@@ -219,14 +311,15 @@ class AntiRushBot:
             # build restores the ring and the trap is whole again.
             mp = game_state.get_resource(self.MP)
             if self.gate_open:
-                if mp >= 10.0 and self.scout_cost > 0:
+                if not pressure and mp >= self.WAVE_MP and \
+                        self.scout_cost > 0:
                     count = int(mp // self.scout_cost)
                     for lane in self.counter_lanes:
                         if (game_state.attempt_spawn(self.SCOUT, [lane],
                                                      count) or 0) > 0:
                             break
                 self.gate_open = False
-            elif sealed and mp >= 7.0:
+            elif sealed and not pressure and mp >= self.GATE_PREP_MP:
                 for loc in self.gate:
                     if game_state.contains_stationary_unit(loc):
                         game_state.attempt_remove([loc])

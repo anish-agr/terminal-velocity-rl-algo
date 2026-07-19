@@ -74,6 +74,7 @@ class AlgoStrategy(gamelib.AlgoCore):
         self.turn_frames = []      # raw parsed turn-frame dicts
         self.enemy_spawns = []     # mobile spawn events (enemy), current turn
         self.flow = [0.0, 0.0, 0.0, 0.0]  # breach dealt/taken, dmg dealt/taken
+        self.breach_xs = []        # x of each breach WE took, current turn
 
         try:
             import numpy as np  # noqa: F401
@@ -110,6 +111,8 @@ class AlgoStrategy(gamelib.AlgoCore):
             for b in state.get("events", {}).get("breach", []):
                 if len(b) >= 5:
                     self.flow[0 if b[4] == 1 else 1] += float(b[1])
+                    if b[4] != 1:
+                        self.breach_xs.append(int(b[0][0]))
             for d in state.get("events", {}).get("damage", []):
                 if len(d) >= 5 and d[2] in _STRUCT_KINDS:
                     self.flow[3 if d[4] == 1 else 2] += float(d[1])
@@ -190,9 +193,11 @@ class AlgoStrategy(gamelib.AlgoCore):
                     sum(1 for s in self.enemy_spawns if s[0] == 3),
                     sum(1 for s in self.enemy_spawns if s[0] == 4),
                     sum(1 for s in self.enemy_spawns if s[0] == 5),
-                    self.flow[1], enemy_mp, turn)
+                    self.flow[1], enemy_mp, turn,
+                    self.flow[0], list(self.breach_xs))
         self.enemy_spawns = []
         self.flow = [0.0, 0.0, 0.0, 0.0]
+        self.breach_xs = []
 
         # anti-rush override (§9.2): while engaged, the scripted counter plays
         # the turn — no mirror rebuild or search needed, so this path also

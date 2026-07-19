@@ -329,7 +329,16 @@ class AntiRushBot:
             # re-engages instantly through the breach-driven `hurt` path above.
             dirty = entry or (self.engaged and not winning and (
                 wave_mp >= self.SUSTAIN_INCOME_FRAC * income or
-                float(enemy_mp) >= self.BANK_HOLD_INCOMES * income))
+                float(enemy_mp) >= self.BANK_HOLD_INCOMES * income or
+                # a PROVEN flooder refilling past a working bank is loading
+                # the next wave: bank decay keeps a 5-turn reload just under
+                # the entry thresholds, so EXIT_CLEAN fired exactly one turn
+                # before the kill wave (ladder 15343219: engaged t5, clean
+                # t5-7 during the reload, net back t8, 17-scout corner flood
+                # t10). Only flooders (a wave that actually breached us) ever
+                # set the flag, so grinders/turtles still release the net.
+                (self.is_flooder and
+                 float(enemy_mp) >= self.PRESSURE_INCOMES * income)))
             self.flags.append(bool(entry))
             del self.flags[:-self.WINDOW]
             self.clean = 0 if dirty else self.clean + 1
@@ -367,6 +376,25 @@ class AntiRushBot:
         for lane in sorted(lanes, key=lambda l: (-self.hot.get(l, 0.0),
                                                  lanes.index(l))):
             out += self.lane_upgrades.get(lane, [])
+        return out
+
+    def _wall_order(self):
+        """Wall row in build order, hottest (most-breached) lane FIRST.
+
+        The static left-to-right list meant a corner rusher's lane was
+        patched LAST: ladder 15343219 breached (27,13) at t4, the engaged
+        counter then spent five income-starved turns building x=0..14 while
+        the right corner stayed open, and the t10 wave killed through the
+        same cell. SP goes where the damage is."""
+        left = [[x, 13] for x in range(0, 10)]
+        center = [[x, 13] for x in range(10, 18) if x not in (13, 14)]
+        right = [[x, 13] for x in range(18, 28)]
+        seg = {"left": left, "center": center, "right": right}
+        lanes = ("center", "left", "right")
+        out = []
+        for lane in sorted(lanes, key=lambda l: (-self.hot.get(l, 0.0),
+                                                 lanes.index(l))):
+            out += seg[lane]
         return out
 
     def _best_lane(self, game_state, wave_hp):
@@ -411,7 +439,7 @@ class AntiRushBot:
         already standing instead of still going up. Never raises."""
         try:
             game_state.attempt_spawn(self.TURRET, self.turrets)
-            game_state.attempt_spawn(self.WALL, self.walls)
+            game_state.attempt_spawn(self.WALL, self._wall_order())
             game_state.attempt_upgrade(self._upgrade_order() +
                                        self.turrets + self.walls)
         except Exception:
@@ -423,7 +451,7 @@ class AntiRushBot:
             turrets = [t for t in self.turrets if t not in self.gate] \
                 if self.gate_open else self.turrets
             game_state.attempt_spawn(self.TURRET, turrets)
-            game_state.attempt_spawn(self.WALL, self.walls)
+            game_state.attempt_spawn(self.WALL, self._wall_order())
             try:
                 enemy_mp = float(game_state.get_resource(self.MP, 1))
             except Exception:

@@ -314,7 +314,15 @@ class AntiRushBot:
             hurt = float(breaches_taken) >= self.BREACH_SPIKE and (
                 scouts >= self.BREACH_MIN_SCOUTS or
                 demos >= self.BREACH_MIN_DEMOS)
-            if hurt:
+            # ANY breach that comes with a real wave marks a proven flooder
+            # (not only a >=4 hp `hurt`): a 3-hp corner poke proves the lane
+            # leaks, so the opponent's next big bank should re-engage the
+            # funnel BEFORE the flood, not after. Their 30-scout follow-up
+            # went through the wall-sparse net for -14 while we sat unengaged
+            # (ladder 15343258: t11 poke -3 ignored, t32 corner flood -14).
+            if float(breaches_taken) > 0 and (
+                    scouts >= self.BREACH_MIN_SCOUTS or
+                    demos >= self.BREACH_MIN_DEMOS):
                 self.is_flooder = True   # remembered for the rest of the match
             spike = (wave_mp >= self.ENTRY_WAVE_INCOMES * income
                      or float(enemy_mp) >= self.BANK_ENTRY_INCOMES * income

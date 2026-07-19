@@ -112,6 +112,13 @@ class AntiRushBot:
     BANK_HOLD_INCOMES = 5.0    # while engaged, a bank this big is dirty —
     #   above the decay cap for the same reason as BANK_ENTRY_INCOMES (the
     #   old 2.5x kept every normal banker's reload "dirty" forever)
+    FLOODER_BANK_INCOMES = 3.0  # a PROVEN flooder (one that has already
+    #   breached us with a wave) reloading a bank this deep is about to flood
+    #   again -> re-engage and screen NOW, even after a long quiet reload.
+    #   Gated on is_flooder so it never fires against a grinder/turtle that
+    #   has not broken through -- those never set the flag (ladder 15342253:
+    #   banker floods every ~15 turns, we disengaged in the quiet gap on
+    #   EXIT_CLEAN and the net, which never screens, ate the next flood)
     WINDOW = 4              # flag window: floods landing every 3rd turn
     #   (the ladder pattern that engaged 20+ turns late) still meet ENGAGE_OF
     ENGAGE_OF = 2           # engage when >= 2 of the last WINDOW are flagged
@@ -231,6 +238,10 @@ class AntiRushBot:
         self.total_taken = 0.0   # a big lead means we are winning, not rushed
         self.hot = {"center": 0.0, "left": 0.0, "right": 0.0}  # breach heat
         self.alert = False     # any flag in the window: pre-harden signal
+        self.is_flooder = False  # sticky: opponent has breached us with a
+        #   wave at least once. A proven flooder's reloaded bank re-engages
+        #   the screen even after a long quiet reload; never resets, so one
+        #   flood commits us to watching their bank for the rest of the match
         self.attack_cols = []  # mirrored columns of the last observed wave —
         #   an attacker crossing the diamond exits on the opposite flank, so
         #   the screen spawns under 27-x for each enemy spawn column x
@@ -274,8 +285,12 @@ class AntiRushBot:
             hurt = float(breaches_taken) >= self.BREACH_SPIKE and (
                 scouts >= self.BREACH_MIN_SCOUTS or
                 demos >= self.BREACH_MIN_DEMOS)
+            if hurt:
+                self.is_flooder = True   # remembered for the rest of the match
             spike = (wave_mp >= self.ENTRY_WAVE_INCOMES * income
                      or float(enemy_mp) >= self.BANK_ENTRY_INCOMES * income
+                     or (self.is_flooder and
+                         float(enemy_mp) >= self.FLOODER_BANK_INCOMES * income)
                      or (self.alert and
                          wave_mp >= self.ALERT_WAVE_INCOMES * income))
             entry = hurt or (spike and not winning)
@@ -377,7 +392,11 @@ class AntiRushBot:
             # bank worth a real flood, or breaches taken last turn — sends
             # every MP to defense; the post-flood turns (bank spent) are the
             # sally window.
-            shown = self.threat_mp >= self.SHOWN_WAVE_INCOMES * self.income
+            # a proven flooder's bank is always a real threat, even after a
+            # long quiet reload decayed the wave memory: size the screen off
+            # their live bank instead of capping it at one turn's income
+            shown = self.is_flooder or \
+                self.threat_mp >= self.SHOWN_WAVE_INCOMES * self.income
             threat = max(enemy_mp if shown else min(enemy_mp, self.income),
                          self.threat_mp * self.THREAT_AFTERGLOW)
             pressure = (self.last_taken > 0 or

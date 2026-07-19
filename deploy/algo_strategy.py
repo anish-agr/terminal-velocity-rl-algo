@@ -194,7 +194,8 @@ class AlgoStrategy(gamelib.AlgoCore):
                     sum(1 for s in self.enemy_spawns if s[0] == 4),
                     sum(1 for s in self.enemy_spawns if s[0] == 5),
                     self.flow[1], enemy_mp, turn,
-                    self.flow[0], list(self.breach_xs))
+                    self.flow[0], list(self.breach_xs),
+                    [s[1] for s in self.enemy_spawns])
         self.enemy_spawns = []
         self.flow = [0.0, 0.0, 0.0, 0.0]
         self.breach_xs = []
@@ -206,6 +207,16 @@ class AlgoStrategy(gamelib.AlgoCore):
             gamelib.debug_write("TV: anti-rush override turn {}".format(turn))
             self.antirush.apply(game_state)
             return   # on_turn logs the staged commands for this turn
+
+        # pre-harden on a rush ALERT (a single flag, before full engagement):
+        # stage defense-only builds now, then let the net play the rest of
+        # the turn — gamelib drops whatever the net can no longer afford
+        if self.antirush is not None and \
+                getattr(self.antirush, "alert", False):
+            try:
+                self.antirush.preharden(game_state)
+            except Exception:
+                pass
 
         mirror = self._rebuild_mirror()
         if mirror is None or not self._mirror_in_sync(mirror, frame):

@@ -90,6 +90,11 @@ class AntiRushBot:
     WIN_MARGIN = 8.0        # cumulative net breach lead at which count/bank
     #   flags are suppressed: an opponent we are out-racing is not a rush,
     #   however many units they field (breach-driven flags stay live)
+    ALERT_WAVE_INCOMES = 1.0   # while ALERTED, a turn spending a full
+    #   turn's income on scouts/demolishers is itself a flag. Pre-hardening
+    #   suppresses the breach evidence (a half-built fortress keeps leaks
+    #   just under BREACH_SPIKE forever), so the follow-up flag must key on
+    #   the opponent's own spend, which our defense cannot mask
     SUSTAIN_INCOME_FRAC = 0.8  # while engaged, a mobile wave worth this
     #   fraction of one turn's income is still dirty (cost-scaled, so it
     #   covers scouts and demolishers alike and ignores late-game dribbles)
@@ -115,6 +120,13 @@ class AntiRushBot:
     #   opponent actually floods. Until then a big bank is hypothetical: it
     #   gets a token screen and never suppresses our counterattack — an idle
     #   bank must not bleed us dry on interceptors (ladder 15340295)
+    IDLE_BANK_INCOMES = 1.5    # a proven flooder below this bank is between
+    #   floods: throttle the screen to SCREEN_IDLE_MAX and bank the rest, so
+    #   interceptor spend concentrates on the turns a flood is imminent
+    SCREEN_IDLE_MAX = 1     # token screen while the flooder is refilling
+    FLOODER_RESERVE_MP = 4.0   # extra bank the counterattack must clear on
+    #   top of WAVE_MP against a proven flooder — offense only from true
+    #   surplus after the defensive screen is funded
     WAVE_MP = 10.0          # bank needed to launch a counterattack wave
     GATE_PREP_MP = 7.0      # bank at which the sally gate is marked
 
@@ -135,9 +147,14 @@ class AntiRushBot:
         self.mp_interval = int(res.get("turnIntervalForBitSchedule", 10)) or 10
 
         # FallbackBot funnel geometry in absolute coordinates — the driver
-        # always plays the bottom seat, so no flip is needed
+        # always plays the bottom seat, so no flip is needed. List order is
+        # build priority, and every cell is re-attempted every turn, so
+        # anything a flood destroys is rebuilt the next turn. The second
+        # row ([7]/[10]/[17]/[20], 12) densifies the flank approaches the
+        # 6-turret ring does not cover against a 20-40 MP mixed wave.
         self.turrets = [[12, 12], [15, 12], [13, 11], [14, 11],
-                        [11, 11], [16, 11], [3, 12], [24, 12]]
+                        [11, 11], [16, 11], [3, 12], [24, 12],
+                        [7, 12], [20, 12], [10, 12], [17, 12]]
         self.walls = [[x, 13] for x in range(28) if x not in (13, 14)]
         # the gap stays open as a one-way trap: the turret ring below it forms
         # a closed pocket, so enemy units that walk in dead-end and
@@ -157,12 +174,16 @@ class AntiRushBot:
                           [[14, y] for y in range(11)]
         self.upgrade_first = [[12, 13], [15, 13], [11, 13], [16, 13]]
         # upgrade groups per lane so apply() can harden whichever lane the
-        # opponent is actually breaching first (hot-lane priority)
+        # opponent is actually breaching first (hot-lane priority): each
+        # lane's turrets plus its full third of the front wall — upgraded
+        # walls have 3x the HP and blunt demolisher fire on that lane
         self.lane_upgrades = {
             "center": self.upgrade_first + [[13, 11], [14, 11], [12, 12],
-                                            [15, 12], [11, 11], [16, 11]],
-            "left": [[3, 12], [0, 13], [1, 13], [2, 13], [3, 13]],
-            "right": [[24, 12], [27, 13], [26, 13], [25, 13], [24, 13]],
+                                            [15, 12], [11, 11], [16, 11],
+                                            [10, 12], [17, 12]] +
+                      [[x, 13] for x in range(10, 18) if x not in (13, 14)],
+            "left": [[3, 12], [7, 12]] + [[x, 13] for x in range(0, 10)],
+            "right": [[24, 12], [20, 12]] + [[x, 13] for x in range(18, 28)],
         }
         # shield pylons flanking the counterattack lane (x 13/14): upgraded
         # supports roughly double a scout's effective hp, which is what lets
@@ -185,9 +206,14 @@ class AntiRushBot:
         self.total_dealt = 0.0   # cumulative breach ledger, both directions —
         self.total_taken = 0.0   # a big lead means we are winning, not rushed
         self.hot = {"center": 0.0, "left": 0.0, "right": 0.0}  # breach heat
+        self.alert = False     # any flag in the window: pre-harden signal
+        self.attack_cols = []  # mirrored columns of the last observed wave —
+        #   an attacker crossing the diamond exits on the opposite flank, so
+        #   the screen spawns under 27-x for each enemy spawn column x
 
     def observe(self, scouts, demolishers, interceptors, breaches_taken,
-                enemy_mp=0.0, turn=0, breaches_dealt=0.0, breach_xs=None):
+                enemy_mp=0.0, turn=0, breaches_dealt=0.0, breach_xs=None,
+                spawn_xs=None):
         """Ingest one completed enemy turn; returns `engaged`. Never raises.
 
         Bank thresholds scale with the per-turn MP income (which grows over
@@ -214,13 +240,19 @@ class AntiRushBot:
                 x = int(x)
                 self.hot["left" if x < 10 else
                          ("right" if x > 17 else "center")] += 1.0
+            if spawn_xs:   # a real wave: remember its arrival columns
+                if wave_mp >= self.SUSTAIN_INCOME_FRAC * income:
+                    self.attack_cols = sorted(
+                        {27 - int(x) for x in spawn_xs})[:3]
             winning = self.total_dealt - self.total_taken >= self.WIN_MARGIN
             hurt = float(breaches_taken) >= self.BREACH_SPIKE and (
                 scouts >= self.BREACH_MIN_SCOUTS or
                 demos >= self.BREACH_MIN_DEMOS)
             spike = (scouts >= self.ENTRY_SCOUTS
                      or demos >= self.ENTRY_DEMOS
-                     or float(enemy_mp) >= self.BANK_ENTRY_INCOMES * income)
+                     or float(enemy_mp) >= self.BANK_ENTRY_INCOMES * income
+                     or (self.alert and
+                         wave_mp >= self.ALERT_WAVE_INCOMES * income))
             entry = hurt or (spike and not winning)
             dirty = entry or (self.engaged and (
                 wave_mp >= self.SUSTAIN_INCOME_FRAC * income or
@@ -230,11 +262,41 @@ class AntiRushBot:
             self.clean = 0 if dirty else self.clean + 1
             if self.engaged:
                 self.engaged = self.clean < self.EXIT_CLEAN
+                if not self.engaged:
+                    self.gate_open = False  # never fire a stale sally wave
+                    #   into a ring the net may have rebuilt meanwhile
             else:
                 self.engaged = sum(self.flags) >= self.ENGAGE_OF
+            self.alert = self.engaged or sum(self.flags) >= 1
         except Exception:
             pass
         return self.engaged
+
+    def _upgrade_order(self):
+        """Lane upgrade lists, hottest (most-breached) lane first; ties keep
+        the center-first default. gamelib skips already-upgraded cells, so
+        repeated entries cost nothing."""
+        lanes = ("center", "left", "right")
+        out = []
+        for lane in sorted(lanes, key=lambda l: (-self.hot.get(l, 0.0),
+                                                 lanes.index(l))):
+            out += self.lane_upgrades.get(lane, [])
+        return out
+
+    def preharden(self, game_state):
+        """Defense-only fortification staged on a rush ALERT (a single flag)
+        while the net still plays the turn: walls, turrets, and upgrades
+        only — no removals, supports, or mobiles. The net's plan is staged
+        after this, so gamelib simply drops whatever it can no longer
+        afford; by the time the detector fully engages, the fortress is
+        already standing instead of still going up. Never raises."""
+        try:
+            game_state.attempt_spawn(self.TURRET, self.turrets)
+            game_state.attempt_spawn(self.WALL, self.walls)
+            game_state.attempt_upgrade(self._upgrade_order() +
+                                       self.turrets + self.walls)
+        except Exception:
+            pass
 
     def apply(self, game_state):
         """Stage one anti-rush turn onto a gamelib GameState. Never raises."""
@@ -259,15 +321,7 @@ class AntiRushBot:
             sealed = missing <= 2
             if sealed:   # shield pylons only once the seal is paid for
                 game_state.attempt_spawn(self.SUPPORT, self.supports)
-            # hot-lane priority: upgrade the lane actually being breached
-            # first (gamelib skips already-upgraded cells, so repeats are
-            # free); ties keep the center-first default order
-            lanes = ("center", "left", "right")
-            upgrades = []
-            for lane in sorted(lanes, key=lambda l: (-self.hot.get(l, 0.0),
-                                                     lanes.index(l))):
-                upgrades += self.lane_upgrades.get(lane, [])
-            game_state.attempt_upgrade(upgrades + self.supports +
+            game_state.attempt_upgrade(self._upgrade_order() + self.supports +
                                        self.turrets + self.walls)
             mp = game_state.get_resource(self.MP)
             try:
@@ -287,13 +341,24 @@ class AntiRushBot:
             pressure = (self.last_taken > 0 or
                         (shown and
                          enemy_mp >= self.PRESSURE_INCOMES * self.income))
-            # interceptor screen sized to that threat and sustained while it
-            # persists (the memory decays over ~4-5 turns), with a floor
-            # while the wall is still going up and a sanity cap — never a
-            # flat max, so a quiet opponent gets a near-zero screen
-            spots = [s for s in self.screens
-                     if not game_state.contains_stationary_unit(s)]
+            # interceptor screen sized to that threat, concentrated on the
+            # turns a flood is imminent (bank full) and throttled to a token
+            # while a proven flooder is refilling — spend follows the flood
+            # cycle instead of dripping a fixed screen every turn
+            spots = []
+            for c in self.attack_cols:   # observed arrival columns first
+                c = min(25, max(2, int(c)))
+                cell = [c, 13 - c] if c <= 13 else [c, c - 14]
+                if not game_state.contains_stationary_unit(cell) \
+                        and cell not in spots:
+                    spots.append(cell)
+            for s in self.screens:       # then the default gap/flank spots
+                if not game_state.contains_stationary_unit(s) \
+                        and s not in spots:
+                    spots.append(s)
             want = int(threat // self.MP_PER_INTERCEPTOR)
+            if shown and enemy_mp < self.IDLE_BANK_INCOMES * self.income:
+                want = min(want, self.SCREEN_IDLE_MAX)
             if not sealed:
                 want = max(want, self.SCREEN_MIN_OPEN)
             want = min(want, self.SCREEN_CAP)
@@ -310,8 +375,12 @@ class AntiRushBot:
             # skipped the gate cell this turn); the turn after, the turret
             # build restores the ring and the trap is whole again.
             mp = game_state.get_resource(self.MP)
+            # vs a proven flooder the counterattack must clear an extra
+            # reserve on top of the wave cost: offense only from true
+            # surplus once the defensive screen is already funded
+            reserve = self.FLOODER_RESERVE_MP if shown else 0.0
             if self.gate_open:
-                if not pressure and mp >= self.WAVE_MP and \
+                if not pressure and mp >= self.WAVE_MP + reserve and \
                         self.scout_cost > 0:
                     count = int(mp // self.scout_cost)
                     for lane in self.counter_lanes:
@@ -319,7 +388,8 @@ class AntiRushBot:
                                                      count) or 0) > 0:
                             break
                 self.gate_open = False
-            elif sealed and not pressure and mp >= self.GATE_PREP_MP:
+            elif sealed and not pressure and \
+                    mp >= self.GATE_PREP_MP + reserve:
                 for loc in self.gate:
                     if game_state.contains_stationary_unit(loc):
                         game_state.attempt_remove([loc])

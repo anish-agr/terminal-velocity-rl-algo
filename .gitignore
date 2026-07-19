@@ -2,6 +2,9 @@
 *.replay
 *__pycache__*
 
+# net weights (3MB+ binaries; live on the pod / in submission zips, not git)
+*.bin
+
 algos/*
 !algos/starter-algo-ZIPME
 

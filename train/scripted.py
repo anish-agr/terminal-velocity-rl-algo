@@ -10,14 +10,14 @@ absolute engine commands:
     turtle           interceptor-heavy active defense, scout counter on a bank
     torture          turn-scripted mechanics gauntlet (removals, upgrades,
                      trapped deploys, banking) — a deliberately weird opponent
-    corner_hammer    the ranked-meta distillation (2026-07-18 replay study of
-                     the visible #1 vs the hidden >2000 pool): winners' full
-                     turret line + banked scout waves, plus the corner/flank
-                     hardening and funnel the whole field under-builds
-    line_grinder     the mid-ladder counter-meta (2026-07-18 study of our own
-                     ranked losses): SOLID turret line + gated demolisher
-                     grind waves — the archetype our net lost 4 of 5 ranked
-                     losses to and has no learned answer for
+    corner_hammer    the ranked-meta distillation (replay study of top-rated
+                     ladder play): winners' full turret line + banked scout
+                     waves, plus the corner/flank hardening and funnel the
+                     rest of the field under-builds
+    line_grinder     the mid-ladder counter-meta (study of our own ranked
+                     losses): solid turret line + gated demolisher grind
+                     waves — the archetype that most punishes a defense
+                     without a learned answer to it
 
 Rules of this module: stateless across turns (anything time-varying derives
 from game.turn), deterministic (no RNG anywhere), every cost read from config,
@@ -190,7 +190,7 @@ def torture(game, player: int, config: dict) -> List[Command]:
 
 
 # ---------------------------------------------------------------------------
-# corner_hammer — the ranked-meta distillation (2026-07-18 replay study)
+# corner_hammer — the ranked-meta distillation (top-ladder replay study)
 # ---------------------------------------------------------------------------
 #
 # All layout constants are in perspective space and were extracted from the 19
@@ -315,7 +315,7 @@ def corner_hammer(game, player: int, config: dict) -> List[Command]:
 
 
 # ---------------------------------------------------------------------------
-# line_grinder — the mid-ladder counter-meta (2026-07-18 ranked-loss study)
+# line_grinder — the mid-ladder counter-meta (ranked-loss replay study)
 # ---------------------------------------------------------------------------
 #
 # Distilled from the three opponents that beat our deployed net with the same

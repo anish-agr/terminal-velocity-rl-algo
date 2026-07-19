@@ -130,9 +130,12 @@ class CornerHammerBot:
             for b in events.get("breach", []):
                 if len(b) >= 5 and b[4] == 2:          # they breached us
                     x = int(b[0][0])
-                    if x < 9:
+                    # every breach heats a side -- ladder 15345616 bled out
+                    # at (9,4)/(18,4), dead center of the old x<9 / x>18
+                    # buckets, so heat never rose and screens never armed
+                    if x <= 13:
                         self.heat["L"] += 1.0
-                    elif x > 18:
+                    else:
                         self.heat["R"] += 1.0
             for s in events.get("spawn", []):
                 if len(s) >= 4 and s[3] == 2:
@@ -220,6 +223,11 @@ class CornerHammerBot:
         gs.attempt_spawn(self.WALL, CORNER_WALLS)
         gs.attempt_upgrade(CORNER_WALLS)
         gs.attempt_spawn(self.TURRET, FLANK_TURRETS)
+        # second layer behind each corner: ladder 15345658 lost -2:30 with
+        # ALL 32 damage through (0,13) -- one chewed corner wall must not be
+        # the only thing between their waves and our hp
+        gs.attempt_spawn(self.WALL, [[1, 13], [26, 13]])
+        gs.attempt_upgrade([[1, 13], [26, 13]])
         if not gate_open_turn:
             gs.attempt_spawn(self.WALL, GATE_WALLS)
         # seal the deep edge diagonals from the start, not just on mega
@@ -298,6 +306,19 @@ class CornerHammerBot:
 
     def _maybe_screen(self, gs, turn, income, enemy_mp, launch_level,
                       threshold, closeout):
+        # EMERGENCY: we are actively being breached (heat decays 0.5/turn,
+        # so this stays hot only while the bleeding continues). Screen the
+        # hot side EVERY turn regardless of arming state -- ladder 15345616
+        # died -2:30 in 13 turns to scout floods walking the deep diagonal
+        # while the normal screen logic waited for a bank signal.
+        if self.heat["L"] + self.heat["R"] >= 1.0 and not closeout:
+            hot_r = self.heat["R"] > self.heat["L"]
+            hot, cold = (SCREEN_R, SCREEN_L) if hot_r else (SCREEN_L, SCREEN_R)
+            spent = self._screen_side(gs, hot, 3)
+            spent += self._screen_side(gs, cold, 1)
+            if spent:
+                self.screen_turn = turn
+            return spent
         if not self.launch_mps and turn <= EARLY_TURNS:
             fixed_point = income / self.mp_decay
             rusher = (enemy_mp >= EARLY_BANK_FRAC * fixed_point and

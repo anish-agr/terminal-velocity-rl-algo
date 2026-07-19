@@ -221,7 +221,17 @@ class AlgoStrategy(gamelib.AlgoCore):
         mirror = self._rebuild_mirror()
         if mirror is None or not self._mirror_in_sync(mirror, frame):
             gamelib.debug_write("TV: mirror out of sync turn {}".format(turn))
-            self.fallback.apply(game_state)
+            # Degrade to the STRONGEST scripted layer, not the weakest.
+            # Ladder audit (2026-07-19, ratings 1500->1295): the mirror
+            # desyncs around turn 9-26 in most ranked games and can never
+            # resync, so this branch plays the entire rest of those matches.
+            # FallbackBot here got farmed by scout bankers (-11:28, -27:16);
+            # AntiRushBot's funnel + threat-sized screens + counterattack is
+            # the layer that actually carried the pre-fix rating.
+            if self.antirush is not None:
+                self.antirush.apply(game_state)
+            else:
+                self.fallback.apply(game_state)
             return   # on_turn logs the staged commands for this turn
 
         # search in a worker; watchdog submits the fallback plan on a miss

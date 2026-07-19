@@ -276,7 +276,12 @@ class AlgoStrategy(gamelib.AlgoCore):
         if "plan" not in result:
             gamelib.debug_write("TV: watchdog ({})".format(
                 result.get("error", "deadline")))
-            self.fallback.apply(game_state)
+            # a missed deadline is a timing problem, not a scripted-layer
+            # bug: degrade to the strongest scripted turn available
+            if self.antirush is not None:
+                self.antirush.apply(game_state)
+            else:
+                self.fallback.apply(game_state)
             return   # on_turn logs the staged commands for this turn
 
         # encode against the REAL banks from the server frame, not the

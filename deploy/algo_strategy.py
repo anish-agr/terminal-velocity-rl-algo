@@ -46,6 +46,10 @@ for _p in (_HERE, os.path.dirname(_HERE)):
 import gamelib  # noqa: E402
 
 from fallback import AntiRushBot, FallbackBot  # noqa: E402
+try:
+    from corner_hammer_bot import CornerHammerBot  # noqa: E402
+except Exception:                     # never let the scripted layer's import
+    CornerHammerBot = None            # take down the whole algo
 
 # The shared ranked box runs ~2-4x slower per thread than a dev machine, so the
 # search must self-limit early (budget) and the watchdog needs headroom under
@@ -118,6 +122,12 @@ class AlgoStrategy(gamelib.AlgoCore):
             self.antirush = AntiRushBot(config)
         except Exception:
             self.antirush = None
+        try:
+            # ladder-proven full game plan (~1400-1500 standalone) -- every
+            # net-degradation path lands here instead of the rush counter
+            self.ch = CornerHammerBot(config) if CornerHammerBot else None
+        except Exception:
+            self.ch = None
         self.our_log = []          # [turn] -> [(kind, x, y), ...] we attempted
         self.enemy_log = []        # [turn] -> reconstructed enemy commands
         self.turn_frames = []      # raw parsed turn-frame dicts
@@ -150,6 +160,11 @@ class AlgoStrategy(gamelib.AlgoCore):
 
     # ------------------------------------------------------------------
     def on_action_frame(self, turn_string):
+        # corner_hammer's breach-heat / wave-composition tracking runs in
+        # EVERY mode: its state must be warm if a degradation hands it the
+        # game mid-match (and it is the whole game plan in fallback mode)
+        if self.ch is not None:
+            self.ch.on_action_frame(turn_string)
         if self.mode != "search":
             return
         try:
@@ -176,11 +191,11 @@ class AlgoStrategy(gamelib.AlgoCore):
             if self.mode == "search":
                 self._search_turn(game_state, turn_state)
             else:
-                self.fallback.apply(game_state)
+                self._scripted(game_state)
         except Exception as exc:
-            gamelib.debug_write("TV: turn error {!r} -> fallback".format(exc))
+            gamelib.debug_write("TV: turn error {!r} -> scripted".format(exc))
             try:
-                self.fallback.apply(game_state)
+                self._scripted(game_state)
             except Exception:
                 pass
         # exactly one log entry per turn frame, recording what gamelib ACTUALLY
@@ -191,6 +206,17 @@ class AlgoStrategy(gamelib.AlgoCore):
         if self.mode == "search" and len(self.our_log) < len(self.turn_frames):
             self.our_log.append(self._staged_cmds(game_state))
         game_state.submit_turn()
+
+    def _scripted(self, game_state):
+        """Strongest scripted layer available. corner_hammer is a full
+        ladder-proven game plan (~1400-1500 standalone); AntiRushBot is a
+        rush counter; FallbackBot is the floor."""
+        if self.ch is not None:
+            self.ch.apply(game_state)
+        elif self.antirush is not None:
+            self.antirush.apply(game_state)
+        else:
+            self.fallback.apply(game_state)
 
     def _staged_cmds(self, game_state):
         """gamelib's per-turn stacks -> engine (kind, x, y) command tuples.
@@ -220,6 +246,11 @@ class AlgoStrategy(gamelib.AlgoCore):
         frame = json.loads(turn_state)
         self.turn_frames.append(frame)
         turn = int(frame["turnInfo"][1])
+
+        # keep corner_hammer's per-turn state warm even on net turns (launch
+        # levels, screen arming, gate machine) -- idempotent, ~0 ms
+        if self.ch is not None:
+            self.ch.observe(game_state)
 
         # finalize LAST turn's enemy reconstruction + histories
         if turn > 0:
@@ -281,13 +312,10 @@ class AlgoStrategy(gamelib.AlgoCore):
         if mirror is None:
             gamelib.debug_write("TV: mirror out of sync turn {}".format(turn))
             # Both mirrors failed (should be rare now): degrade to the
-            # STRONGEST scripted layer, not the weakest. FallbackBot here
-            # got farmed by scout bankers (-11:28, -27:16); AntiRushBot's
-            # funnel + threat-sized screens + counterattack held ~1445.
-            if self.antirush is not None:
-                self.antirush.apply(game_state)
-            else:
-                self.fallback.apply(game_state)
+            # STRONGEST scripted layer -- corner_hammer, the full ladder-
+            # proven game plan (~1400-1500 standalone), with its adaptive
+            # state kept warm by observe() every turn since game start.
+            self._scripted(game_state)
             return   # on_turn logs the staged commands for this turn
 
         # the search must plan against the REAL banks (frame truth), not the
@@ -328,10 +356,7 @@ class AlgoStrategy(gamelib.AlgoCore):
                 result.get("error", "deadline")))
             # a missed deadline is a timing problem, not a scripted-layer
             # bug: degrade to the strongest scripted turn available
-            if self.antirush is not None:
-                self.antirush.apply(game_state)
-            else:
-                self.fallback.apply(game_state)
+            self._scripted(game_state)
             return   # on_turn logs the staged commands for this turn
 
         # encode against the REAL banks from the server frame, not the

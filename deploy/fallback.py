@@ -279,7 +279,11 @@ class AntiRushBot:
                      or (self.alert and
                          wave_mp >= self.ALERT_WAVE_INCOMES * income))
             entry = hurt or (spike and not winning)
-            dirty = entry or (self.engaged and (
+            # once we hold a real breach lead the net is out-racing them, so
+            # sustained waves must NOT keep us engaged — hand control back and
+            # let the net (which wins these) play. A genuine reversal still
+            # re-engages instantly through the breach-driven `hurt` path above.
+            dirty = entry or (self.engaged and not winning and (
                 wave_mp >= self.SUSTAIN_INCOME_FRAC * income or
                 float(enemy_mp) >= self.BANK_HOLD_INCOMES * income))
             self.flags.append(bool(entry))
@@ -292,7 +296,11 @@ class AntiRushBot:
                     #   into a ring the net may have rebuilt meanwhile
             else:
                 self.engaged = sum(self.flags) >= self.ENGAGE_OF
-            self.alert = self.engaged or sum(self.flags) >= 1
+            # pre-harden only while a threat is live AND we are not already
+            # ahead — a winning game must not keep bleeding the net's SP into
+            # walls it does not need (alert is unused once engaged: apply()
+            # runs the whole defense itself).
+            self.alert = (self.engaged or sum(self.flags) >= 1) and not winning
         except Exception:
             pass
         return self.engaged

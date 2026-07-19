@@ -60,15 +60,15 @@ _WATCHDOG_S = 4.5
 _STRUCT_KINDS = (0, 1, 2)
 _MOBILE_KINDS = (3, 4, 5)
 
-# Primary strategy switch. The neural-net search LOSES real ladder games: it
-# sprays ~30 turrets with almost no walls, dribbles offense into interior /
-# self-trapping cells, and deals ~0 breach (ladder 15343406/16/26/32 = 0-4,
-# offense dying in OUR half, 3/1/0/0 damage dealt). It cannot be validated
-# locally (no engine / .so here). CornerHammerBot is the proven ~1400-1500
-# standalone ladder bot. Until the net is fixed AND verified on a real box,
-# run the proven scripted plan from turn 0 instead of benching it only on a
-# desync/watchdog miss. Flip back to True once the net is trustworthy.
-NET_PRIMARY = False
+# Primary strategy switch. The net is the main plan; the scripted layer
+# (CornerHammer > AntiRush > Fallback) only covers desync/watchdog misses.
+# The net's offense used to bleed out because it deployed onto lanes that
+# reach the enemy but through 2-3x the turret fire of the best lane (ladder
+# 15343406/16/26/32); _stage now stages structures first and routes every
+# offense wave to the safest reaching lane, fixing that at the driver level
+# without touching the learned policy. Set False to bench the net and run the
+# scripted plan from turn 0 (fallback if the net regresses on the ladder).
+NET_PRIMARY = True
 # The net is far stronger than the scripted fallback (pod arena: 9-0 vs the
 # whole panel, offense connecting, scout_rush +34 / static_maze +36), so the
 # driver's job is to keep the net planning on a CORRECT board every turn.
@@ -394,66 +394,92 @@ class AlgoStrategy(gamelib.AlgoCore):
     # ------------------------------------------------------------------
     def _stage(self, game_state, cmds):
         info = self.config["unitInformation"]
-        attack_cell = "unset"   # lazily computed best working edge, once/turn
+        # PASS 1: stage every structure / remove / upgrade FIRST. The net
+        # seals its own corners with this turn's new turrets; if we path a
+        # mobile against the PRE-placement board (as the old single pass did)
+        # a corner cell looks open and the reroute is skipped -- then the unit
+        # death-marches laterally across our front through enemy fire and dies
+        # in our half (ladder 15343406/26/32). Path against the FINAL board.
+        mobiles = []
         for (kind, x, y) in cmds:
             if kind in _STRUCT_KINDS:
                 game_state.attempt_spawn(info[kind]["shorthand"], [[x, y]])
-            elif kind in _MOBILE_KINDS:
-                loc = [x, y]
-                # OFFENSE (scout/demolisher) that self-destructs in our own
-                # half does nothing (ladder 15343256: 123 of the net's scouts
-                # died at y=12, 0 dmg). Reroute it to a lane that actually
-                # reaches the enemy. Interceptors are left alone -- dying in
-                # our half IS their job (screening).
-                if kind in (3, 4) and self._self_traps(game_state, loc):
-                    if attack_cell == "unset":
-                        attack_cell = self._best_attack_cell(game_state)
-                    if attack_cell is not None:
-                        loc = list(attack_cell)
-                game_state.attempt_spawn(info[kind]["shorthand"], [loc])
             elif kind == 6:
                 game_state.attempt_remove([[x, y]])
             elif kind == 7:
                 game_state.attempt_upgrade([[x, y]])
+            elif kind in _MOBILE_KINDS:
+                mobiles.append((kind, x, y))
+
+        # PASS 2: mobiles. OFFENSE (scout/demolisher) is routed to the safest
+        # lane that actually reaches the enemy -- not merely "any lane that
+        # reaches" (the net's cells reach but through 2-3x the turret fire of
+        # the best lane: t18 (26,12) danger 69 vs (13,0) 28). Concentrating
+        # the wave on one low-danger lane also punches through better than the
+        # net's scatter. Interceptors are left where the net put them -- dying
+        # in our half IS their screening job.
+        lanes = None    # lazily computed once: sorted [(danger, cell), ...]
+        for (kind, x, y) in mobiles:
+            loc = [x, y]
+            if kind in (3, 4):
+                if lanes is None:
+                    lanes = self._ranked_lanes(game_state)
+                routed = self._route_offense(game_state, loc, lanes)
+                if routed is None:
+                    continue      # fully walled in -- don't feed the grinder
+                loc = routed
+            game_state.attempt_spawn(info[kind]["shorthand"], [loc])
 
     @staticmethod
     def _reaches_enemy(path):
         return bool(path) and len(path) >= 1 and path[-1][1] >= 14
 
-    def _self_traps(self, game_state, loc):
-        """True if a mobile unit spawned at loc self-destructs in our half
-        (its path never reaches the enemy side)."""
+    def _lane_cost(self, game_state, cell):
+        """(reaches_enemy, danger) for a deploy cell on the CURRENT board.
+        danger = total enemy-turret shots the path walks through."""
         try:
-            if game_state.contains_stationary_unit(loc):
-                return False
-            return not self._reaches_enemy(game_state.find_path_to_edge(loc))
+            if game_state.contains_stationary_unit(cell):
+                return (False, None)
+            path = game_state.find_path_to_edge(cell)
+            if not self._reaches_enemy(path):
+                return (False, None)
+            danger = sum(len(game_state.get_attackers(c, 0) or ())
+                         for c in path)
+            return (True, danger)
         except Exception:
-            return False
+            return (False, None)
 
-    def _best_attack_cell(self, game_state):
-        """Least-defended bottom-edge deploy cell whose path reaches the enemy
-        half; None if we are fully walled in (leave the net's choice as-is)."""
+    def _ranked_lanes(self, game_state):
+        """All bottom-edge deploy cells that reach the enemy, cheapest first."""
         try:
             gm = game_state.game_map
             cells = gm.get_edge_locations(gm.BOTTOM_LEFT) + \
                 gm.get_edge_locations(gm.BOTTOM_RIGHT)
         except Exception:
-            return None
-        best, best_danger = None, None
+            return []
+        out = []
         for c in cells:
-            try:
-                if game_state.contains_stationary_unit(c):
-                    continue
-                path = game_state.find_path_to_edge(c)
-                if not self._reaches_enemy(path):
-                    continue
-                danger = sum(len(game_state.get_attackers(cell, 0) or ())
-                             for cell in path)
-            except Exception:
-                continue
-            if best_danger is None or danger < best_danger:
-                best, best_danger = list(c), danger
-        return best
+            ok, danger = self._lane_cost(game_state, c)
+            if ok:
+                out.append((danger, list(c)))
+        out.sort(key=lambda t: t[0])
+        return out
+
+    def _route_offense(self, game_state, loc, lanes):
+        """Where an offense unit the net wants at `loc` should actually go.
+        None if no lane reaches the enemy (leave the wave unspent)."""
+        if not lanes:
+            return None
+        best_danger, best_cell = lanes[0]
+        ok, danger = self._lane_cost(game_state, loc)
+        if not ok:
+            return best_cell        # self-traps -> safest lane
+        # the net's cell reaches the enemy but if it eats materially more fire
+        # than the best lane, move the wave there (corner death-marches score
+        # 2-3x the danger of the true best lane)
+        if danger > 1.25 * best_danger + 5:
+            return best_cell
+        return list(loc)
 
     def _reconstruct_enemy(self, prev_idx):
         """Enemy commands for the turn between frames prev_idx and prev_idx+1:

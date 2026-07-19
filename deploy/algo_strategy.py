@@ -67,6 +67,44 @@ _MOBILE_KINDS = (3, 4, 5)
 # a far smaller error than handing the match to the scripted layer.
 
 
+class _GameView:
+    """Sim mirror that reports the REAL banks from the server frame.
+
+    The frame-grounded mirror cannot reproduce SP/MP exactly (the sim API has
+    no state injection), and a cap-level mirror bank made the search plan big
+    waves that encode-clamping then shrank to 3-4 units -- the net dribbled
+    undersized attacks into massed turrets all game (ladder 15343220: 110
+    spawns at one cell, 5 dmg dealt). Plan generation and the net's scalar
+    inputs read banks through stats()/scalar_features(), so overriding those
+    two with frame truth makes every generated plan affordable FOR REAL.
+    Forks are handed back unwrapped: they exist to evolve the sim forward,
+    and the candidate plans are already bank-clamped by then."""
+
+    def __init__(self, game, sp0, mp0, sp1, mp1):
+        self._g = game
+        self._b = (float(sp0), float(mp0), float(sp1), float(mp1))
+
+    def stats(self, player):
+        hp, sp, mp = self._g.stats(player)
+        sp0, mp0, sp1, mp1 = self._b
+        return (hp, sp0, mp0) if player == 0 else (hp, sp1, mp1)
+
+    def scalar_features(self, player):
+        sf = list(self._g.scalar_features(player))
+        sp0, mp0, sp1, mp1 = self._b
+        try:
+            if player == 0:
+                sf[1], sf[2], sf[4], sf[5] = sp0, mp0, sp1, mp1
+            else:
+                sf[1], sf[2], sf[4], sf[5] = sp1, mp1, sp0, mp0
+        except Exception:
+            pass
+        return sf
+
+    def __getattr__(self, name):
+        return getattr(self._g, name)
+
+
 class AlgoStrategy(gamelib.AlgoCore):
     def __init__(self):
         super().__init__()
@@ -252,13 +290,25 @@ class AlgoStrategy(gamelib.AlgoCore):
                 self.fallback.apply(game_state)
             return   # on_turn logs the staged commands for this turn
 
+        # the search must plan against the REAL banks (frame truth), not the
+        # mirror's approximation -- see _GameView
+        try:
+            view = _GameView(
+                mirror,
+                float(game_state.get_resource(game_state.SP)),
+                float(game_state.get_resource(game_state.MP)),
+                float(game_state.get_resource(game_state.SP, 1)),
+                float(game_state.get_resource(game_state.MP, 1)))
+        except Exception:
+            view = mirror
+
         # search in a worker; watchdog submits the fallback plan on a miss
         result = {}
 
         def work():
             try:
                 result["plan"] = choose(
-                    mirror, self.client, self.cfg, 0,
+                    view, self.client, self.cfg, 0,
                     self.hist_own, self.hist_opp, self.config, self.costs,
                     prev_opp_plan=self.prev_opp_plan,
                     k=int(self.cfg["search"]["k_deploy"]),

@@ -68,7 +68,13 @@ _MOBILE_KINDS = (3, 4, 5)
 # offense wave to the safest reaching lane, fixing that at the driver level
 # without touching the learned policy. Set False to bench the net and run the
 # scripted plan from turn 0 (fallback if the net regresses on the ladder).
-NET_PRIMARY = True
+#
+# FINAL SUBMISSION: False. The net went 0-11 on the ladder dealing ~0 breach
+# (15343406..15344940), and even the t14 handover couldn't save games the
+# net's first 14 turns had already poisoned (40 turrets, no walls, SP gone).
+# CornerHammer plays the WHOLE game; it is the only plan that provably wins
+# on the real engine.
+NET_PRIMARY = False
 
 # Mid-game handover: the net keeps the game UNLESS it is clearly failing, at
 # which point CornerHammer (kept warm by observe()/on_action_frame every turn)

@@ -68,6 +68,12 @@ MEGA_INCOMES = 3.0
 STALL_WAVES = 2
 CLOSEOUT_TURN = 80
 CLOSEOUT_LEAD = 8
+# A dense BASE-turret front line (the ladder archetype that farmed the net:
+# 15344900/30/40 all built 10+ turrets across their front row by mid-game)
+# shreds pure scout waves just like an upgraded one. Lead with demolishers
+# (outrange turrets, clear the line) and send scouts BEHIND them to breach.
+DEMO_FRONT_TURRETS = 7
+DEMO_LEAD_FRAC = 0.6
 
 
 class CornerHammerBot:
@@ -216,6 +222,11 @@ class CornerHammerBot:
         gs.attempt_spawn(self.TURRET, FLANK_TURRETS)
         if not gate_open_turn:
             gs.attempt_spawn(self.WALL, GATE_WALLS)
+        # seal the deep edge diagonals from the start, not just on mega
+        # threat: every close game bled there (arena: shielded_push breached
+        # (25,11)/(24,10)/(23,9) t3-13, flood breached (8,5)/(7,6)) -- rushes
+        # hug the diagonal and slip under the y13/12 line
+        gs.attempt_spawn(self.WALL, DIAG_WALLS_L + DIAG_WALLS_R)
         gs.attempt_spawn(self.TURRET, DIAG_TURRETS)
         gs.attempt_spawn(self.TURRET, DEEP_TURRETS)
         gs.attempt_upgrade(FIRST_UPGRADES)
@@ -366,16 +377,32 @@ class CornerHammerBot:
     def _fire_wave(self, gs, mp, turn):
         self.wave_idx += 1
         heavy, light = self._pick_lanes(gs)
-        demo_wave = (self.demo_mode or self.wave_idx % 3 == 0 or
+        dense_front = self._front_turrets(gs) >= DEMO_FRONT_TURRETS
+        demo_wave = (self.demo_mode or self.wave_idx % 3 == 0 or dense_front or
                      self._their_front_upgraded_heavy(gs))
         if demo_wave:
-            n = int(mp // self.demo_cost)
-            if n >= 3:
-                n_h = max(1, (2 * n) // 3)
-                gs.attempt_spawn(self.DEMOLISHER, [heavy], n_h)
-                gs.attempt_spawn(self.DEMOLISHER, [light], n - n_h)
+            if dense_front:
+                # demo-led punch: demolishers outrange the line and clear it,
+                # scouts follow the SAME lane and pour through the hole. A
+                # pure demo wave kills structures but rarely breaches; a pure
+                # scout wave dies to the line. The mix does both.
+                demo_mp = DEMO_LEAD_FRAC * mp
+                n_d = int(demo_mp // self.demo_cost)
+                if n_d >= 2:
+                    gs.attempt_spawn(self.DEMOLISHER, [heavy], n_d)
+                    n_s = int((mp - n_d * self.demo_cost) // self.scout_cost)
+                    if n_s > 0:
+                        gs.attempt_spawn(self.SCOUT, [heavy], n_s)
+                else:
+                    demo_wave = False
             else:
-                demo_wave = False
+                n = int(mp // self.demo_cost)
+                if n >= 3:
+                    n_h = max(1, (2 * n) // 3)
+                    gs.attempt_spawn(self.DEMOLISHER, [heavy], n_h)
+                    gs.attempt_spawn(self.DEMOLISHER, [light], n - n_h)
+                else:
+                    demo_wave = False
         if not demo_wave:
             n = int(mp // self.scout_cost)
             n_h = max(1, (7 * n) // 10)
@@ -418,6 +445,22 @@ class CornerHammerBot:
         return dmg
 
     # ------------------------------------------------------------------
+    def _front_turrets(self, gs):
+        """How many turrets (any level) the enemy has on their front rows."""
+        n = 0
+        try:
+            for y in (14, 15, 16):
+                for x in range(28):
+                    if not gs.game_map.in_arena_bounds([x, y]):
+                        continue
+                    for u in gs.game_map[x, y] or []:
+                        if (u.stationary and u.player_index == 1 and
+                                u.unit_type == self.TURRET):
+                            n += 1
+        except Exception:
+            return 0
+        return n
+
     def _their_front_upgraded_heavy(self, gs):
         up = base = 0
         try:

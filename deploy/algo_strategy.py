@@ -11,7 +11,8 @@ Per turn under rung 1:
     (mobile spawns) + turn-frame diffs (builds, upgrades, removal deaths), and
     replay BOTH sides' command logs into a fresh sim -> the mirror state
   - cross-check the mirror's structures against the server's turn frame; on
-    mismatch, log and fall back to the scripted plan for this turn
+    mismatch, rebuild the mirror FROM the frame itself (_frame_ground_mirror)
+    so the net keeps playing; only if that also fails, scripted plan
   - if the anti-rush detector is engaged (opponent is mass-scouting), stage
     the scripted AntiRushBot counter instead of running the search at all
   - run search.choose with the anytime budget in a worker thread; a watchdog
@@ -55,15 +56,15 @@ _WATCHDOG_S = 4.5
 _STRUCT_KINDS = (0, 1, 2)
 _MOBILE_KINDS = (3, 4, 5)
 # The net is far stronger than the scripted fallback (pod arena: 9-0 vs the
-# whole panel, offense connecting, scout_rush +34 / static_maze +36). Imperfect
-# opponent-command reconstruction drifts a few structures mid-match and USED to
-# bench the net onto the fallback for the rest of the game (whose counterattack
-# self-destructs in our own funnel: 285/298 units died at y=12, 0 dmg dealt).
-# Tolerate a small structure mismatch so the net keeps planning on a nearly-
-# correct board instead of handing the match to the broken fallback. Exact
-# matches (every desync-free turn, and the whole deterministic arena panel) are
-# unaffected -- diff 0 is always in sync, so the 9-0 panel result is preserved.
-_MIRROR_DRIFT_TOLERANCE = 10
+# whole panel, offense connecting, scout_rush +34 / static_maze +36), so the
+# driver's job is to keep the net planning on a CORRECT board every turn.
+# The log-replay mirror drifts when the opponent's submission order is
+# ambiguous (combat tie-breaks shift kills by a frame); when that happens the
+# driver no longer benches the net -- it rebuilds the mirror FROM THE SERVER
+# FRAME itself (_frame_ground_mirror), which cannot drift because it is
+# re-derived from observed truth each turn. Structure positions are exact by
+# construction; only structure damage is approximated (full health), which is
+# a far smaller error than handing the match to the scripted layer.
 
 
 class AlgoStrategy(gamelib.AlgoCore):
@@ -228,16 +229,23 @@ class AlgoStrategy(gamelib.AlgoCore):
             except Exception:
                 pass
 
+        # mirror ladder: log-replay (exact history, real structure damage)
+        # -> frame-grounded (exact positions/hp rebuilt from the server frame
+        # itself, so a desync can no longer bench the net) -> scripted.
         mirror = self._rebuild_mirror()
-        if mirror is None or not self._mirror_in_sync(mirror, frame):
+        if mirror is not None and not self._mirror_in_sync(mirror, frame):
+            mirror = None
+        if mirror is None:
+            mirror = self._frame_ground_mirror(frame)
+            if mirror is not None:
+                gamelib.debug_write(
+                    "TV: frame-grounded mirror turn {}".format(turn))
+        if mirror is None:
             gamelib.debug_write("TV: mirror out of sync turn {}".format(turn))
-            # Degrade to the STRONGEST scripted layer, not the weakest.
-            # Ladder audit (2026-07-19, ratings 1500->1295): the mirror
-            # desyncs around turn 9-26 in most ranked games and can never
-            # resync, so this branch plays the entire rest of those matches.
-            # FallbackBot here got farmed by scout bankers (-11:28, -27:16);
-            # AntiRushBot's funnel + threat-sized screens + counterattack is
-            # the layer that actually carried the pre-fix rating.
+            # Both mirrors failed (should be rare now): degrade to the
+            # STRONGEST scripted layer, not the weakest. FallbackBot here
+            # got farmed by scout bankers (-11:28, -27:16); AntiRushBot's
+            # funnel + threat-sized screens + counterattack held ~1445.
             if self.antirush is not None:
                 self.antirush.apply(game_state)
             else:
@@ -271,8 +279,17 @@ class AlgoStrategy(gamelib.AlgoCore):
             self.fallback.apply(game_state)
             return   # on_turn logs the staged commands for this turn
 
+        # encode against the REAL banks from the server frame, not the
+        # mirror's (a frame-grounded mirror approximates SP/MP; the plan must
+        # be clamped to what we can actually afford this turn)
+        try:
+            sp_real = float(game_state.get_resource(game_state.SP))
+            mp_real = float(game_state.get_resource(game_state.MP))
+        except Exception:
+            sp_real = mirror.stats(0)[1]
+            mp_real = mirror.stats(0)[2]
         spec = ScratchSpec(self.costs, mirror.structures(),
-                           mirror.stats(0)[1], mirror.stats(0)[2], False, 0)
+                           sp_real, mp_real, False, 0)
         cmds = encode_plan(list(result["plan"]), spec())
         self._stage(game_state, cmds)
         # on_turn records the staged stacks (what the server will actually
@@ -324,20 +341,123 @@ class AlgoStrategy(gamelib.AlgoCore):
         except Exception:
             return None
 
-    def _mirror_in_sync(self, mirror, frame):
-        """Structure positions must match the server within a small drift
-        tolerance. Exact match (diff 0) is always in sync; a few drifted cells
-        from imperfect opponent-command reconstruction keep the (much stronger)
-        net playing rather than benching it onto the fallback for the match."""
+    def _frame_ground_mirror(self, frame):
+        """Fresh sim snapped to the server's CURRENT frame (the desync cure).
+
+        The log-replay mirror drifts because reconstructed opponent commands
+        cannot recover submission order, so combat tie-breaks diverge. This
+        builder never replays history: it re-derives the state from the frame
+        itself, so it cannot drift. The sim API has no state injection, so the
+        state is reproduced with catch-up turns:
+          1. HP: every mobile unit breaches for 1 on this config, so scouts
+             crossing the EMPTY board set both players' hp exactly (sides
+             alternate turns so the waves never meet mid-board).
+          2. Board: issue every structure the frame shows for both sides each
+             turn until placed (the engine skips unaffordable commands, and
+             cumulative income guarantees eventual affordability); upgrades
+             the same way. No mobiles are in play, so nothing fights.
+          3. Clock: pad empty turns so the sim turn matches the real turn and
+             the search's lookahead sees the right income schedule.
+        Structure positions and player hp are exact (verified before return);
+        structure DAMAGE resets to full and MP/SP banks approximate -- far
+        smaller errors than benching the net, and the encode-time ScratchSpec
+        uses the REAL banks from gamelib anyway. Returns None on any failure.
+        """
         try:
-            server = set()
+            turn = int(frame["turnInfo"][1])
+            res = self.config.get("resources", {})
+            start_hp = float(res.get("startingHP", 30.0))
+            hp_tgt = [float(frame["p1Stats"][0]), float(frame["p2Stats"][0])]
+            want = {0: set(), 1: set()}
+            upg = {0: set(), 1: set()}
             for pid, key in ((0, "p1Units"), (1, "p2Units")):
                 lists = frame.get(key, [])
                 for kind in _STRUCT_KINDS:
                     for u in (lists[kind] if kind < len(lists) else []):
-                        server.add((kind, pid, int(u[0]), int(u[1])))
+                        want[pid].add((kind, int(u[0]), int(u[1])))
+                if len(lists) > 7:
+                    upg[pid] = {(int(u[0]), int(u[1])) for u in lists[7]}
+            info = self.config["unitInformation"]
+            scout_cost = float(info[3].get("cost2", 1.0)) or 1.0
+
+            g = self.terminal_sim.Game(self.sim_config_str)
+            budget = turn + 24   # hard stop: never loop unbounded
+
+            # -- 1. hp via breaches on the empty board ----------------------
+            spawn = {0: (3, 13, 0), 1: (3, 14, 27)}
+            used = 0
+            while used < budget:
+                # damage each side still has to deal (their scouts hit the
+                # OTHER player's hp)
+                d0 = int(round(g.stats(1)[0] - hp_tgt[1]))
+                d1 = int(round(g.stats(0)[0] - hp_tgt[0]))
+                if d0 <= 0 and d1 <= 0:
+                    break
+                side = 0 if d0 >= d1 else 1
+                need = d0 if side == 0 else d1
+                n = min(need, int(g.stats(side)[2] // scout_cost))
+                cmds = [[], []]
+                cmds[side] = [spawn[side]] * max(n, 0)
+                g.play_turn(cmds[0], cmds[1])
+                used += 1
+
+            # -- 2. structures + upgrades, both sides at once ---------------
+            while used < budget:
+                placed = {0: set(), 1: set()}
+                upped = {0: set(), 1: set()}
+                for s in g.structures():
+                    placed[s[1]].add((s[0], s[2], s[3]))
+                    if s[5]:
+                        upped[s[1]].add((s[2], s[3]))
+                cmds = []
+                done = True
+                for p in (0, 1):
+                    cs = [(k, x, y) for (k, x, y) in sorted(want[p] - placed[p])]
+                    cells = {(x, y) for (_, x, y) in want[p]}
+                    cs += [(7, x, y) for (x, y) in
+                           sorted((upg[p] & cells) - upped[p])]
+                    if cs:
+                        done = False
+                    cmds.append(cs)
+                if done:
+                    break
+                g.play_turn(cmds[0], cmds[1])
+                used += 1
+
+            # -- 3. clock alignment ----------------------------------------
+            while g.turn < turn and used < budget:
+                g.play_turn([], [])
+                used += 1
+
+            # -- acceptance: exact positions, exact hp ---------------------
+            ours = {(s[0], s[1], s[2], s[3]) for s in g.structures()}
+            if ours != self._server_structs(frame):
+                return None
+            if abs(g.stats(0)[0] - hp_tgt[0]) > 0.5 or \
+                    abs(g.stats(1)[0] - hp_tgt[1]) > 0.5:
+                return None
+            return g
+        except Exception:
+            return None
+
+    def _server_structs(self, frame):
+        """(kind, player, x, y) set from a server turn frame."""
+        server = set()
+        for pid, key in ((0, "p1Units"), (1, "p2Units")):
+            lists = frame.get(key, [])
+            for kind in _STRUCT_KINDS:
+                for u in (lists[kind] if kind < len(lists) else []):
+                    server.add((kind, pid, int(u[0]), int(u[1])))
+        return server
+
+    def _mirror_in_sync(self, mirror, frame):
+        """Structure position multisets must match the server exactly. (A
+        drift tolerance was tried on ladder and lost anyway -- the net paths
+        against walls that are not there. The frame-grounded rebuild replaces
+        a desynced mirror with an exact one instead of tolerating drift.)"""
+        try:
             ours = {(s[0], s[1], s[2], s[3]) for s in mirror.structures()}
-            return len(ours ^ server) <= _MIRROR_DRIFT_TOLERANCE
+            return ours == self._server_structs(frame)
         except Exception:
             return False
 

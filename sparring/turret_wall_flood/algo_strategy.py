@@ -1,10 +1,10 @@
-"""Sparring bot: TURRET WALL FLOOD -- the ladder archetype that beat us.
+"""Sparring bot: TURRET WALL FLOOD -- a common ranked-ladder archetype.
 
-Mimics the opponents from ladder 15344900/15344930/15344940 (all losses):
-a dense line of base turrets across row 14 built immediately, corner walls,
-steady turret reinforcement, and periodic mass-scout floods once the bank
-fills. Scout waves into that front line die dealing ~0 unless the attacker
-leads with demolishers or finds an unwatched corner.
+A dense line of base turrets across the front row built immediately, corner
+walls, steady turret reinforcement, and periodic mass-scout floods once the
+bank fills. Scout waves into that front line die dealing ~0 unless the
+attacker leads with demolishers or finds an unwatched corner -- this bot
+exists to keep that weakness measured.
 
 Deterministic: fixed build order, fixed flood threshold, lane choice is a
 pure function of the board (least_damage_lane).
@@ -34,8 +34,7 @@ class AlgoStrategy(gamelib.AlgoCore):
         self.scout_cost = mobile_cost(config, 3)
         self.turret_damage = config["unitInformation"][2].get("attackDamageWalker", 0.0)
 
-        # dense base-turret front line, center-out (mirror of 15344930's t0:
-        # turrets at 26,25,24,22,21,20,18,16,14,13... along its front row)
+        # dense base-turret front line, built center-out
         self.front = [[x, 13] for x in
                       (13, 14, 16, 18, 20, 21, 22, 24, 25, 26,
                        11, 9, 7, 6, 5, 3, 2, 1)]
@@ -44,7 +43,7 @@ class AlgoStrategy(gamelib.AlgoCore):
                              [9, 12], [18, 12]]
 
         self.lanes = [[13, 0], [14, 0], [7, 6], [20, 6]]
-        self.flood_mp = 12.0     # bank then flood, like the ladder games
+        self.flood_mp = 12.0     # bank, then flood
 
     def on_turn(self, turn_state):
         game_state = gamelib.GameState(self.config, turn_state)

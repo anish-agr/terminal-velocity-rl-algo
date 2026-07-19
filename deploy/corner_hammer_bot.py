@@ -1,16 +1,11 @@
-"""CornerHammerBot -- the standalone corner_hammer algo adapted to the
-deploy stack's scripted-layer interface (FallbackBot/AntiRushBot pattern).
+"""CornerHammerBot -- the primary scripted game plan.
 
-This is bots/corner_hammer/algo_strategy.py (branch shane/corner-hammer-algo,
-v9.1) with the AlgoCore shell removed: the driver owns the turn loop and
-submit; this class only stages commands via apply(game_state). Keep the two
-files in sync when the standalone bot iterates.
-
-Why it exists: the ladder-proven scripted layer. The standalone bot holds
-~1400-1500 on the ranked ladder across five audit-fix iterations, while
-AntiRushBot (the previous degradation target) is a rush-counter, not a full
-game plan. Every net-degradation path (watchdog miss, double mirror failure,
-turn error, import-failure fallback mode) now lands here instead.
+A full-match strategy in the deploy stack's scripted-layer interface: the
+driver owns the turn loop and submit; this class only stages commands. The
+plan is a hardened corner-anchored fortress (upgraded corner walls, flank
+turret clusters, sealed center gate) with a banked wave offense cycled
+through the gate, adaptive interceptor screens, and per-side reinforcement
+driven by observed breach heat.
 
 Integration contract:
   * __init__(config)            -- build once at game start
@@ -22,10 +17,10 @@ Integration contract:
   * apply(game_state)           -- stage this turn's commands (never raises,
                                    never submits)
 
-State notes for mid-game takeover: the defense wishlist rebuilds toward the
-corner_hammer layout from whatever board the net left (attempt_* calls are
-SP-throttled and skip occupied cells); the gate state machine self-corrects
-in one turn. Pure python + gamelib game_state calls only -- works in the
+Built for mid-game takeover as well as full games: the defense wishlist
+rebuilds toward this layout from whatever board it inherits (attempt_*
+calls are SP-throttled and skip occupied cells), and the gate state machine
+self-corrects in one turn. Pure python + gamelib only -- works in the
 no-numpy fallback environment too.
 """
 
@@ -68,10 +63,9 @@ MEGA_INCOMES = 3.0
 STALL_WAVES = 2
 CLOSEOUT_TURN = 80
 CLOSEOUT_LEAD = 8
-# A dense BASE-turret front line (the ladder archetype that farmed the net:
-# 15344900/30/40 all built 10+ turrets across their front row by mid-game)
-# shreds pure scout waves just like an upgraded one. Lead with demolishers
-# (outrange turrets, clear the line) and send scouts BEHIND them to breach.
+# A dense base-turret front line shreds pure scout waves just like an
+# upgraded one. Against one, lead with demolishers (they outrange turrets
+# and clear the line) and send scouts behind them to breach.
 DEMO_FRONT_TURRETS = 7
 DEMO_LEAD_FRAC = 0.6
 
@@ -130,9 +124,8 @@ class CornerHammerBot:
             for b in events.get("breach", []):
                 if len(b) >= 5 and b[4] == 2:          # they breached us
                     x = int(b[0][0])
-                    # every breach heats a side -- ladder 15345616 bled out
-                    # at (9,4)/(18,4), dead center of the old x<9 / x>18
-                    # buckets, so heat never rose and screens never armed
+                    # every breach heats its nearer side -- narrower buckets
+                    # left a dead zone where breaches never armed the screen
                     if x <= 13:
                         self.heat["L"] += 1.0
                     else:
@@ -223,17 +216,14 @@ class CornerHammerBot:
         gs.attempt_spawn(self.WALL, CORNER_WALLS)
         gs.attempt_upgrade(CORNER_WALLS)
         gs.attempt_spawn(self.TURRET, FLANK_TURRETS)
-        # second layer behind each corner: ladder 15345658 lost -2:30 with
-        # ALL 32 damage through (0,13) -- one chewed corner wall must not be
-        # the only thing between their waves and our hp
+        # second wall layer behind each corner: one chewed corner wall must
+        # not be the only thing between their waves and our hp
         gs.attempt_spawn(self.WALL, [[1, 13], [26, 13]])
         gs.attempt_upgrade([[1, 13], [26, 13]])
         if not gate_open_turn:
             gs.attempt_spawn(self.WALL, GATE_WALLS)
-        # seal the deep edge diagonals from the start, not just on mega
-        # threat: every close game bled there (arena: shielded_push breached
-        # (25,11)/(24,10)/(23,9) t3-13, flood breached (8,5)/(7,6)) -- rushes
-        # hug the diagonal and slip under the y13/12 line
+        # seal the deep edge diagonals from the start, not only on a mega
+        # threat: rushes hug the diagonal and slip under the y13/12 line
         gs.attempt_spawn(self.WALL, DIAG_WALLS_L + DIAG_WALLS_R)
         gs.attempt_spawn(self.TURRET, DIAG_TURRETS)
         gs.attempt_spawn(self.TURRET, DEEP_TURRETS)
@@ -306,11 +296,10 @@ class CornerHammerBot:
 
     def _maybe_screen(self, gs, turn, income, enemy_mp, launch_level,
                       threshold, closeout):
-        # EMERGENCY: we are actively being breached (heat decays 0.5/turn,
+        # Emergency: we are actively being breached (heat decays 0.5/turn,
         # so this stays hot only while the bleeding continues). Screen the
-        # hot side EVERY turn regardless of arming state -- ladder 15345616
-        # died -2:30 in 13 turns to scout floods walking the deep diagonal
-        # while the normal screen logic waited for a bank signal.
+        # hot side every turn regardless of arming state -- waiting for a
+        # bank signal loses to floods that are already landing.
         if self.heat["L"] + self.heat["R"] >= 1.0 and not closeout:
             hot_r = self.heat["R"] > self.heat["L"]
             hot, cold = (SCREEN_R, SCREEN_L) if hot_r else (SCREEN_L, SCREEN_R)

@@ -1,26 +1,30 @@
-"""Deployment driver (ARCHITECTURE §9.3): thin gamelib shim around the search.
+"""Deployment driver: a thin gamelib shim around the strategy stack.
 
-Startup ladder (each rung degrades gracefully to the next):
-  1. terminal_sim .so + weights.bin + numpy  -> full K x M search (anytime budget)
-  2. weights.bin + numpy, no .so             -> currently also fallback (the
-     search needs sim forks; a net-only greedy mode is a possible upgrade)
-  3. anything missing or crashed             -> FallbackBot plays the match
+Strategy ladder (each rung degrades gracefully to the next):
+  1. neural-net search  -- terminal_sim + weights.bin + numpy present, and
+     NET_PRIMARY is True: K x M plan search under an anytime budget
+  2. CornerHammerBot    -- full scripted game plan (primary when the net is
+     benched, and the landing spot for every net-degradation path)
+  3. AntiRushBot        -- scripted rush counter (driver override while its
+     detector is engaged)
+  4. FallbackBot        -- minimal static plan; the floor that always submits
 
-Per turn under rung 1:
+Per turn under the search rung:
   - reconstruct the enemy's last-turn commands from observed action frames
-    (mobile spawns) + turn-frame diffs (builds, upgrades, removal deaths), and
-    replay BOTH sides' command logs into a fresh sim -> the mirror state
+    (mobile spawns) plus turn-frame diffs (builds, upgrades, removal deaths),
+    and replay both sides' command logs into a fresh sim (the mirror)
   - cross-check the mirror's structures against the server's turn frame; on
-    mismatch, rebuild the mirror FROM the frame itself (_frame_ground_mirror)
-    so the net keeps playing; only if that also fails, scripted plan
-  - if the anti-rush detector is engaged (opponent is mass-scouting), stage
-    the scripted AntiRushBot counter instead of running the search at all
-  - run search.choose with the anytime budget in a worker thread; a watchdog
-    submits the FallbackBot plan if the worker misses its deadline
+    mismatch, rebuild the mirror from the frame itself (_frame_ground_mirror)
+    so the net keeps playing; only if that also fails, play a scripted turn
+  - while the anti-rush detector is engaged, stage the scripted counter
+    instead of running the search at all
+  - run search.choose in a worker thread; a watchdog stages a scripted turn
+    if the worker misses its deadline
   - stage the chosen commands through gamelib and append them to our log
 
-The engine always presents OUR side as the bottom half, so this driver is
-always player 0 in the mirror sim; the opponent is player 1.
+The engine always presents our side as the bottom half, so this driver is
+always player 0 in the mirror sim; the opponent is player 1. See
+train/ARCHITECTURE.md for the full system design.
 """
 
 import json
@@ -29,11 +33,10 @@ import sys
 import threading
 
 # Cap BLAS/OpenMP threads BEFORE numpy is ever imported (here or in npforward).
-# The competition container is process/thread-restricted; uncapped OpenBLAS tries
-# to spawn one thread per host core, hits RLIMIT_NPROC, and the import/first matmul
-# raises -> the search worker dies every turn -> FallbackBot plays the whole match
-# (looks fine in playground, which has more headroom). setdefault so an explicit
-# env override still wins.
+# The competition container is process/thread-restricted; uncapped OpenBLAS
+# tries to spawn one thread per host core, hits RLIMIT_NPROC, and the first
+# matmul raises -- which would kill the search worker every turn. setdefault
+# so an explicit env override still wins.
 for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
            "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
     os.environ.setdefault(_v, "1")
@@ -51,66 +54,42 @@ try:
 except Exception:                     # never let the scripted layer's import
     CornerHammerBot = None            # take down the whole algo
 
-# The shared ranked box runs ~2-4x slower per thread than a dev machine, so the
-# search must self-limit early (budget) and the watchdog needs headroom under
-# the engine's 5s per-turn cap. At 2.5/3.8 the k16/m8 floor round overran every
-# turn and the driver submitted FallbackBot for the whole match.
+# The shared ranked box runs 2-4x slower per thread than a dev machine, so the
+# search must self-limit (budget) and the watchdog needs headroom under the
+# engine's 5 s per-turn cap.
 _SEARCH_BUDGET_S = 1.6
 _WATCHDOG_S = 4.5
 _STRUCT_KINDS = (0, 1, 2)
 _MOBILE_KINDS = (3, 4, 5)
 
-# Primary strategy switch. The net is the main plan; the scripted layer
-# (CornerHammer > AntiRush > Fallback) only covers desync/watchdog misses.
-# The net's offense used to bleed out because it deployed onto lanes that
-# reach the enemy but through 2-3x the turret fire of the best lane (ladder
-# 15343406/16/26/32); _stage now stages structures first and routes every
-# offense wave to the safest reaching lane, fixing that at the driver level
-# without touching the learned policy. Set False to bench the net and run the
-# scripted plan from turn 0 (fallback if the net regresses on the ladder).
-#
-# FINAL SUBMISSION: False. The net went 0-11 on the ladder dealing ~0 breach
-# (15343406..15344940), and even the t14 handover couldn't save games the
-# net's first 14 turns had already poisoned (40 turrets, no walls, SP gone).
-# CornerHammer plays the WHOLE game; it is the only plan that provably wins
-# on the real engine.
+# Primary strategy switch. True: the net plays every turn and the scripted
+# ladder only covers degradations (desync, watchdog miss, turn error). False:
+# CornerHammerBot plays the whole game and the net is benched. The final
+# competition build shipped with False -- on the ranked ladder the net's play
+# did not convert to breach damage, while the scripted plan won consistently.
 NET_PRIMARY = False
 
-# Mid-game handover: the net keeps the game UNLESS it is clearly failing, at
-# which point CornerHammer (kept warm by observe()/on_action_frame every turn)
-# takes over for the rest of the match. The net dealt 0 breach and lost all 8
-# recent ladder games -- some by turtling to a tie-break loss (15343649 30:30),
-# some outright (15343624 4:30). Trigger AFTER a grace opening on: losing by a
-# clear health margin, OR a no-offense stall (~0 breach dealt while not ahead).
-# Sticky once tripped -- no flip-flopping back to the net.
+# Mid-game handover (search mode only): the net keeps the game unless it is
+# clearly failing, at which point CornerHammer -- whose adaptive state is kept
+# warm every turn -- takes over for the rest of the match. After a grace
+# opening, trigger on a clear health deficit or a no-offense stall. Sticky
+# once tripped, so control never flip-flops.
 _HANDOVER_GRACE_TURNS = 14
 _HANDOVER_HEALTH_GAP = 6.0
 _HANDOVER_STALL_BREACH = 2.0
 
-# The net is far stronger than the scripted fallback (pod arena: 9-0 vs the
-# whole panel, offense connecting, scout_rush +34 / static_maze +36), so the
-# driver's job is to keep the net planning on a CORRECT board every turn.
-# The log-replay mirror drifts when the opponent's submission order is
-# ambiguous (combat tie-breaks shift kills by a frame); when that happens the
-# driver no longer benches the net -- it rebuilds the mirror FROM THE SERVER
-# FRAME itself (_frame_ground_mirror), which cannot drift because it is
-# re-derived from observed truth each turn. Structure positions are exact by
-# construction; only structure damage is approximated (full health), which is
-# a far smaller error than handing the match to the scripted layer.
-
 
 class _GameView:
-    """Sim mirror that reports the REAL banks from the server frame.
+    """Sim mirror that reports the real SP/MP banks from the server frame.
 
-    The frame-grounded mirror cannot reproduce SP/MP exactly (the sim API has
-    no state injection), and a cap-level mirror bank made the search plan big
-    waves that encode-clamping then shrank to 3-4 units -- the net dribbled
-    undersized attacks into massed turrets all game (ladder 15343220: 110
-    spawns at one cell, 5 dmg dealt). Plan generation and the net's scalar
-    inputs read banks through stats()/scalar_features(), so overriding those
-    two with frame truth makes every generated plan affordable FOR REAL.
-    Forks are handed back unwrapped: they exist to evolve the sim forward,
-    and the candidate plans are already bank-clamped by then."""
+    The frame-grounded mirror cannot reproduce banks exactly (the sim API has
+    no state injection), and a too-large mirror bank makes the search plan
+    waves that encode-time clamping then shrinks -- undersized attacks
+    dribbled into massed turrets. Plan generation and the net's scalar inputs
+    read banks through stats()/scalar_features(), so overriding those two
+    with frame truth makes every generated plan affordable for real. Forks
+    are handed back unwrapped: they exist to evolve the sim forward, and the
+    candidate plans are already bank-clamped by then."""
 
     def __init__(self, game, sp0, mp0, sp1, mp1):
         self._g = game
@@ -152,8 +131,6 @@ class AlgoStrategy(gamelib.AlgoCore):
         except Exception:
             self.antirush = None
         try:
-            # ladder-proven full game plan (~1400-1500 standalone) -- every
-            # net-degradation path lands here instead of the rush counter
             self.ch = CornerHammerBot(config) if CornerHammerBot else None
         except Exception:
             self.ch = None
@@ -186,8 +163,6 @@ class AlgoStrategy(gamelib.AlgoCore):
                 self.mode = "search"
                 gamelib.debug_write("TV: full search mode")
             else:
-                # net loaded but benched (it loses real ladder games) --
-                # play the proven CornerHammer plan every turn instead
                 self.mode = "corner_hammer"
                 gamelib.debug_write("TV: corner_hammer primary (net benched)")
         except Exception as exc:
@@ -195,9 +170,9 @@ class AlgoStrategy(gamelib.AlgoCore):
 
     # ------------------------------------------------------------------
     def on_action_frame(self, turn_string):
-        # corner_hammer's breach-heat / wave-composition tracking runs in
-        # EVERY mode: its state must be warm if a degradation hands it the
-        # game mid-match (and it is the whole game plan in fallback mode)
+        # CornerHammer's breach-heat / wave-composition tracking runs in
+        # every mode: its state must be warm if a degradation hands it the
+        # game mid-match (and it is the whole game plan when primary).
         if self.ch is not None:
             self.ch.on_action_frame(turn_string)
         if self.mode != "search":
@@ -234,11 +209,11 @@ class AlgoStrategy(gamelib.AlgoCore):
                 self._scripted(game_state)
             except Exception:
                 pass
-        # exactly one log entry per turn frame, recording what gamelib ACTUALLY
-        # staged (fallback turns included, and net of gamelib's own filtering).
-        # Logging [] here instead would leave every future mirror rebuild
-        # missing this turn's builds -> _mirror_in_sync fails -> permanent
-        # fallback lock-in after a single watchdog miss.
+        # Exactly one log entry per turn frame, recording what gamelib
+        # actually staged (scripted turns included, and net of gamelib's own
+        # filtering). Logging [] instead would leave every future mirror
+        # rebuild missing this turn's builds -> _mirror_in_sync fails ->
+        # permanent fallback lock-in after a single watchdog miss.
         if self.mode == "search" and len(self.our_log) < len(self.turn_frames):
             self.our_log.append(self._staged_cmds(game_state))
         game_state.submit_turn()
@@ -269,9 +244,7 @@ class AlgoStrategy(gamelib.AlgoCore):
             pass
 
     def _scripted(self, game_state):
-        """Strongest scripted layer available. corner_hammer is a full
-        ladder-proven game plan (~1400-1500 standalone); AntiRushBot is a
-        rush counter; FallbackBot is the floor."""
+        """Stage a turn from the strongest scripted layer available."""
         if self.ch is not None:
             self.ch.apply(game_state)
         elif self.antirush is not None:
@@ -308,7 +281,7 @@ class AlgoStrategy(gamelib.AlgoCore):
         self.turn_frames.append(frame)
         turn = int(frame["turnInfo"][1])
 
-        # keep corner_hammer's per-turn state warm even on net turns (launch
+        # keep CornerHammer's per-turn state warm even on net turns (launch
         # levels, screen arming, gate machine) -- idempotent, ~0 ms
         if self.ch is not None:
             self.ch.observe(game_state)
@@ -341,9 +314,9 @@ class AlgoStrategy(gamelib.AlgoCore):
         self.flow = [0.0, 0.0, 0.0, 0.0]
         self.breach_xs = []
 
-        # anti-rush override (§9.2): while engaged, the scripted counter plays
-        # the turn — no mirror rebuild or search needed, so this path also
-        # rescues games where the mirror has desynced into permanent fallback
+        # anti-rush override: while engaged, the scripted counter plays the
+        # turn -- no mirror rebuild or search needed, so this path also
+        # rescues games where the mirror has desynced
         if self.antirush is not None and self.antirush.engaged:
             gamelib.debug_write("TV: anti-rush override turn {}".format(turn))
             self.antirush.apply(game_state)
@@ -351,7 +324,7 @@ class AlgoStrategy(gamelib.AlgoCore):
 
         # pre-harden on a rush ALERT (a single flag, before full engagement):
         # stage defense-only builds now, then let the net play the rest of
-        # the turn — gamelib drops whatever the net can no longer afford
+        # the turn -- gamelib drops whatever the net can no longer afford
         if self.antirush is not None and \
                 getattr(self.antirush, "alert", False):
             try:
@@ -361,7 +334,7 @@ class AlgoStrategy(gamelib.AlgoCore):
 
         # mirror ladder: log-replay (exact history, real structure damage)
         # -> frame-grounded (exact positions/hp rebuilt from the server frame
-        # itself, so a desync can no longer bench the net) -> scripted.
+        # itself, so a desync cannot bench the net) -> scripted turn.
         mirror = self._rebuild_mirror()
         if mirror is not None and not self._mirror_in_sync(mirror, frame):
             mirror = None
@@ -372,10 +345,6 @@ class AlgoStrategy(gamelib.AlgoCore):
                     "TV: frame-grounded mirror turn {}".format(turn))
         if mirror is None:
             gamelib.debug_write("TV: mirror out of sync turn {}".format(turn))
-            # Both mirrors failed (should be rare now): degrade to the
-            # STRONGEST scripted layer -- corner_hammer, the full ladder-
-            # proven game plan (~1400-1500 standalone), with its adaptive
-            # state kept warm by observe() every turn since game start.
             self._scripted(game_state)
             return   # on_turn logs the staged commands for this turn
 
@@ -391,7 +360,7 @@ class AlgoStrategy(gamelib.AlgoCore):
         except Exception:
             view = mirror
 
-        # search in a worker; watchdog submits the fallback plan on a miss
+        # search in a worker; watchdog stages a scripted turn on a miss
         result = {}
 
         def work():
@@ -415,14 +384,11 @@ class AlgoStrategy(gamelib.AlgoCore):
         if "plan" not in result:
             gamelib.debug_write("TV: watchdog ({})".format(
                 result.get("error", "deadline")))
-            # a missed deadline is a timing problem, not a scripted-layer
-            # bug: degrade to the strongest scripted turn available
             self._scripted(game_state)
             return   # on_turn logs the staged commands for this turn
 
         # encode against the REAL banks from the server frame, not the
-        # mirror's (a frame-grounded mirror approximates SP/MP; the plan must
-        # be clamped to what we can actually afford this turn)
+        # mirror's -- the plan must be clamped to what is affordable now
         try:
             sp_real = float(game_state.get_resource(game_state.SP))
             mp_real = float(game_state.get_resource(game_state.MP))
@@ -434,17 +400,15 @@ class AlgoStrategy(gamelib.AlgoCore):
         cmds = encode_plan(list(result["plan"]), spec())
         self._stage(game_state, cmds)
         # on_turn records the staged stacks (what the server will actually
-        # get) rather than `cmds` — gamelib may have filtered some attempts
+        # get) rather than `cmds` -- gamelib may have filtered some attempts
 
     # ------------------------------------------------------------------
     def _stage(self, game_state, cmds):
         info = self.config["unitInformation"]
-        # PASS 1: stage every structure / remove / upgrade FIRST. The net
-        # seals its own corners with this turn's new turrets; if we path a
-        # mobile against the PRE-placement board (as the old single pass did)
-        # a corner cell looks open and the reroute is skipped -- then the unit
-        # death-marches laterally across our front through enemy fire and dies
-        # in our half (ladder 15343406/26/32). Path against the FINAL board.
+        # Pass 1: stage every structure / remove / upgrade first, so mobile
+        # pathing in pass 2 sees the board as it will actually stand this
+        # turn. Pathing against the pre-placement board misses cells this
+        # turn's own builds are about to seal.
         mobiles = []
         for (kind, x, y) in cmds:
             if kind in _STRUCT_KINDS:
@@ -456,13 +420,13 @@ class AlgoStrategy(gamelib.AlgoCore):
             elif kind in _MOBILE_KINDS:
                 mobiles.append((kind, x, y))
 
-        # PASS 2: mobiles. OFFENSE (scout/demolisher) is routed to the safest
-        # lane that actually reaches the enemy -- not merely "any lane that
-        # reaches" (the net's cells reach but through 2-3x the turret fire of
-        # the best lane: t18 (26,12) danger 69 vs (13,0) 28). Concentrating
-        # the wave on one low-danger lane also punches through better than the
-        # net's scatter. Interceptors are left where the net put them -- dying
-        # in our half IS their screening job.
+        # Pass 2: mobiles. Offense (scouts/demolishers) is routed to the
+        # safest lane that actually reaches the enemy -- not merely any lane
+        # that reaches, since a reachable lane can still eat several times
+        # the turret fire of the best one. Concentrating the wave on one
+        # low-danger lane also punches through better than scattering it.
+        # Interceptors are left where the plan put them: dying in our half
+        # is their screening job.
         lanes = None    # lazily computed once: sorted [(danger, cell), ...]
         for (kind, x, y) in mobiles:
             loc = [x, y]
@@ -480,7 +444,7 @@ class AlgoStrategy(gamelib.AlgoCore):
         return bool(path) and len(path) >= 1 and path[-1][1] >= 14
 
     def _lane_cost(self, game_state, cell):
-        """(reaches_enemy, danger) for a deploy cell on the CURRENT board.
+        """(reaches_enemy, danger) for a deploy cell on the current board.
         danger = total enemy-turret shots the path walks through."""
         try:
             if game_state.contains_stationary_unit(cell):
@@ -511,7 +475,7 @@ class AlgoStrategy(gamelib.AlgoCore):
         return out
 
     def _route_offense(self, game_state, loc, lanes):
-        """Where an offense unit the net wants at `loc` should actually go.
+        """Where an offense unit planned at `loc` should actually deploy.
         None if no lane reaches the enemy (leave the wave unspent)."""
         if not lanes:
             return None
@@ -519,9 +483,8 @@ class AlgoStrategy(gamelib.AlgoCore):
         ok, danger = self._lane_cost(game_state, loc)
         if not ok:
             return best_cell        # self-traps -> safest lane
-        # the net's cell reaches the enemy but if it eats materially more fire
-        # than the best lane, move the wave there (corner death-marches score
-        # 2-3x the danger of the true best lane)
+        # keep the planned cell unless it eats materially more fire than the
+        # best lane
         if danger > 1.25 * best_danger + 5:
             return best_cell
         return list(loc)
@@ -562,7 +525,7 @@ class AlgoStrategy(gamelib.AlgoCore):
             return None
 
     def _frame_ground_mirror(self, frame):
-        """Fresh sim snapped to the server's CURRENT frame (the desync cure).
+        """Fresh sim snapped to the server's current frame (the desync cure).
 
         The log-replay mirror drifts because reconstructed opponent commands
         cannot recover submission order, so combat tie-breaks diverge. This
@@ -579,9 +542,10 @@ class AlgoStrategy(gamelib.AlgoCore):
           3. Clock: pad empty turns so the sim turn matches the real turn and
              the search's lookahead sees the right income schedule.
         Structure positions and player hp are exact (verified before return);
-        structure DAMAGE resets to full and MP/SP banks approximate -- far
-        smaller errors than benching the net, and the encode-time ScratchSpec
-        uses the REAL banks from gamelib anyway. Returns None on any failure.
+        structure damage resets to full and the SP/MP banks are approximate --
+        far smaller errors than benching the net, and the encode-time
+        ScratchSpec uses the real banks from gamelib anyway. Returns None on
+        any failure.
         """
         try:
             turn = int(frame["turnInfo"][1])
@@ -671,10 +635,10 @@ class AlgoStrategy(gamelib.AlgoCore):
         return server
 
     def _mirror_in_sync(self, mirror, frame):
-        """Structure position multisets must match the server exactly. (A
-        drift tolerance was tried on ladder and lost anyway -- the net paths
-        against walls that are not there. The frame-grounded rebuild replaces
-        a desynced mirror with an exact one instead of tolerating drift.)"""
+        """Structure position multisets must match the server exactly.
+        Tolerating drift was tried and rejected: the net paths against walls
+        that are not there. The frame-grounded rebuild replaces a desynced
+        mirror with an exact one instead."""
         try:
             ours = {(s[0], s[1], s[2], s[3]) for s in mirror.structures()}
             return ours == self._server_structs(frame)

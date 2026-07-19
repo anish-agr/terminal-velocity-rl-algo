@@ -158,6 +158,22 @@ class AntiRushBot:
     #   at 0-0 breaches to turn 99 and lost the coin flip)
     HOLD_DEMOS_MP = 12.0    # in the safe-siege window, bank at which the sally
     #   switches to demolishers — they break the structures scouts bounce off
+    MEGA_BANK_INCOMES = 3.0  # while under pressure (not holding a stalemate),
+    #   an enemy bank this deep means a flood the open-gap trap pocket cannot
+    #   eat (ladder 15342397: a banked 24-scout wave went straight through the
+    #   pocket for -17). Seal the gap with walls for the turn — the trap
+    #   becomes a plain sealed line and the flood grinds on upgraded walls.
+    #   The next quieter turn the gap-clear removes the plugs and the trap is
+    #   back. Never sealed while our own sally wave is going out (gate_open)
+    #   or while breaking a stalemate (holding) — both need the corridor
+    TURRET_DMG_EST = 6.0    # per-attacker-per-step damage estimate for lane
+    #   scoring (between base 5-6 and upgraded ~15-20, biased low so we do
+    #   not over-hold the counterattack)
+    SUICIDE_RATIO = 1.5     # skip the wave when projected turret damage along
+    #   the chosen path exceeds this multiple of the wave's total hp — firing
+    #   anyway is feeding the funnel (ladder 15342407: 285/298 demolishers
+    #   died inside our own half for 0 damage). The MP stays banked and the
+    #   wave fires when their defense thins or our bank out-scales it
     STALL_TURNS = 4         # engaged this many breach-free turns while the
     #   opponent only banks (never commits a breaching wave) = a STALEMATE our
     #   standing defense is winning: stop pouring MP into interceptors and push
@@ -178,6 +194,8 @@ class AntiRushBot:
         self.scout_cost = float(info[3].get("cost2", 1.0))
         self.demolisher_cost = float(info[4].get("cost2", 2.0))
         self.interceptor_cost = float(info[5].get("cost2", 1.0))
+        self.scout_hp = float(info[3].get("startHealth", 15.0))
+        self.demolisher_hp = float(info[4].get("startHealth", 5.0))
         self.MP = 1
         res = config.get("resources", {})
         self.mp_per_round = float(res.get("bitsPerRound", 5.0))
@@ -228,11 +246,14 @@ class AntiRushBot:
         # a counter wave survive the turrets guarding the funnel exit
         self.supports = [[12, 10], [15, 10], [12, 8], [15, 8]]
         self.screens = [[13, 0], [6, 7], [21, 7]]  # gap mouth, then flanks
-        # counterattack spawn candidates — all on the bottom-LEFT edge so
-        # every wave shares one target edge (top-right) beyond the gap; any
-        # cell may be blocked by a structure a previous (net) turn built, so
-        # apply() takes the first free one
-        self.counter_lanes = [[13, 0], [12, 1], [11, 2], [10, 3]]
+        # counterattack spawn candidates on BOTH bottom edges — left-edge
+        # cells target the top-right edge, right-edge cells the top-left, so
+        # the two groups produce genuinely different paths through the gap.
+        # apply() scores every free candidate with real gamelib pathing
+        # (_best_lane) and fires the least-defended one instead of always
+        # ramming the same center corridor the opponent has learned to gun
+        self.counter_lanes = [[13, 0], [12, 1], [11, 2], [10, 3],
+                              [14, 0], [15, 1], [16, 2], [17, 3]]
 
         self.flags = []        # rush flags for the last WINDOW observed turns
         self.clean = 0         # consecutive clean turns
@@ -348,6 +369,39 @@ class AntiRushBot:
             out += self.lane_upgrades.get(lane, [])
         return out
 
+    def _best_lane(self, game_state, wave_hp):
+        """Least-defended counterattack spawn cell by REAL gamelib pathing.
+
+        Scores each free candidate by the number of enemy attackers covering
+        every step of the exact path gamelib predicts. Lanes whose path
+        dead-ends on our half would feed the wave to our own funnel (ladder
+        15342407: 285/298 demolishers died at y<=12 for 0 damage), so they
+        are skipped; if even the best lane's projected damage exceeds
+        SUICIDE_RATIO x the wave's total hp, returns None and the caller
+        keeps the MP banked. Never raises."""
+        best, best_danger = None, None
+        for lane in self.counter_lanes:
+            try:
+                if game_state.contains_stationary_unit(lane):
+                    continue
+                path = game_state.find_path_to_edge(lane)
+                if not path or len(path) < 2:
+                    continue
+                if path[-1][1] < 14:
+                    continue   # dead-ends on our half: self-destruct feed
+                danger = 0
+                for cell in path:
+                    danger += len(game_state.get_attackers(cell, 0) or ())
+            except Exception:
+                continue
+            if best_danger is None or danger < best_danger:
+                best, best_danger = lane, danger
+        if best is None:
+            return None
+        if best_danger * self.TURRET_DMG_EST > wave_hp * self.SUICIDE_RATIO:
+            return None
+        return best
+
     def preharden(self, game_state):
         """Defense-only fortification staged on a rush ALERT (a single flag)
         while the net still plays the turn: walls, turrets, and upgrades
@@ -370,9 +424,25 @@ class AntiRushBot:
                 if self.gate_open else self.turrets
             game_state.attempt_spawn(self.TURRET, turrets)
             game_state.attempt_spawn(self.WALL, self.walls)
+            try:
+                enemy_mp = float(game_state.get_resource(self.MP, 1))
+            except Exception:
+                enemy_mp = 0.0
+            # our standing defense has held for STALL_TURNS turns: whatever
+            # the opponent is banking, it is not breaking through — treat as
+            # a stalemate to be broken by offense, not defended to a tiebreak
+            holding = self.breach_free >= self.STALL_TURNS
+            # mega-flood seal: a bank the trap pocket cannot eat is about to
+            # launch — plug the gap for this turn (skip its clearing below);
+            # the next quieter turn restores the trap
+            mega = (not self.gate_open and not holding and
+                    enemy_mp >= self.MEGA_BANK_INCOMES * self.income)
+            if mega:
+                game_state.attempt_spawn(self.WALL, self.gap)
             # keep the trap gap and the wave corridor clear of leftover
             # net-built structures
-            for loc in self.gap + self.lane_clear:
+            clear = self.lane_clear if mega else self.gap + self.lane_clear
+            for loc in clear:
                 if game_state.contains_stationary_unit(loc):
                     game_state.attempt_remove([loc])
             # posture from the wall line as it will stand THIS turn (gamelib
@@ -389,10 +459,6 @@ class AntiRushBot:
             game_state.attempt_upgrade(self._upgrade_order() + self.supports +
                                        self.turrets + self.walls)
             mp = game_state.get_resource(self.MP)
-            try:
-                enemy_mp = float(game_state.get_resource(self.MP, 1))
-            except Exception:
-                enemy_mp = 0.0
             # measured threat: the bank they could throw right now, floored
             # by an afterglow of the biggest recent wave — but an opponent
             # who has never shown a real wave only ever gets a token screen,
@@ -410,10 +476,6 @@ class AntiRushBot:
             pressure = (self.last_taken > 0 or
                         (shown and
                          enemy_mp >= self.PRESSURE_INCOMES * self.income))
-            # our standing defense has held for STALL_TURNS turns: whatever the
-            # opponent is banking, it is not breaking through, so treat this as
-            # a stalemate to be broken by offense, not defended to a tiebreak
-            holding = self.breach_free >= self.STALL_TURNS
             # interceptor screen sized to that threat, concentrated on the
             # turns a flood is imminent (bank full) and throttled to a token
             # while a proven flooder is refilling — spend follows the flood
@@ -482,14 +544,18 @@ class AntiRushBot:
                         self.scout_cost > 0:
                     if push_now and mp >= self.HOLD_DEMOS_MP and \
                             self.demolisher_cost > 0:
-                        kind, unit_cost = self.DEMOLISHER, self.demolisher_cost
+                        kind, unit_cost, unit_hp = (
+                            self.DEMOLISHER, self.demolisher_cost,
+                            self.demolisher_hp)
                     else:
-                        kind, unit_cost = self.SCOUT, self.scout_cost
+                        kind, unit_cost, unit_hp = (
+                            self.SCOUT, self.scout_cost, self.scout_hp)
                     count = int(mp // unit_cost)
-                    for lane in self.counter_lanes:
-                        if (game_state.attempt_spawn(kind, [lane],
-                                                     count) or 0) > 0:
-                            break
+                    # fire down the least-defended REAL path; hold the bank
+                    # instead of feeding a hopeless lane
+                    lane = self._best_lane(game_state, count * unit_hp)
+                    if lane is not None:
+                        game_state.attempt_spawn(kind, [lane], count)
                 self.gate_open = False
             elif sealed and (holding or not pressure) and \
                     mp >= self.GATE_PREP_MP + reserve:

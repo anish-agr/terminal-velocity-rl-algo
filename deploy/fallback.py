@@ -295,7 +295,16 @@ class AntiRushBot:
                     self.gate_open = False  # never fire a stale sally wave
                     #   into a ring the net may have rebuilt meanwhile
             else:
-                self.engaged = sum(self.flags) >= self.ENGAGE_OF
+                # a single hard breach (heavy hp lost alongside a real wave)
+                # engages NOW — the class docstring already promises this
+                # ("a rush that is actually hurting us still engages
+                # immediately"), but ENGAGE_OF alone waited for a SECOND
+                # flag that a corner banker never supplies: its sub-threshold
+                # waves in between are absorbed (0 breach, under 4.5x income),
+                # so the net kept playing and lost (ladder 15342052 t10=-14,
+                # 15342119 t45=-17). hurt is damage-gated, so grinders and
+                # turtles that never breach us still leave the net in control.
+                self.engaged = sum(self.flags) >= self.ENGAGE_OF or hurt
             # pre-harden only while a threat is live AND we are not already
             # ahead — a winning game must not keep bleeding the net's SP into
             # walls it does not need (alert is unused once engaged: apply()
@@ -421,7 +430,17 @@ class AntiRushBot:
             reserve = 0.0 if safe_siege else \
                 (self.FLOODER_RESERVE_MP if shown else 0.0)
             if self.gate_open:
-                if not pressure and mp >= self.WAVE_MP + reserve and \
+                # the gate was already committed on the prep turn (a ring
+                # turret is down), so fire the banked wave whenever we are not
+                # actively being breached -- even if the flooder's bank has
+                # since refilled. Gating the FIRE on `not pressure` (which a
+                # 3-turn banker re-trips to PRESSURE_INCOMES by the fire turn)
+                # meant we prepped and never fired: 0/2 hp dealt while the
+                # opponent sat at full health and eventually cracked us
+                # (ladder 15342126/052). The defensive screen is already
+                # funded above and `reserve` stays banked, so this only ever
+                # spends true surplus; a live breach still holds the wave.
+                if self.last_taken == 0 and mp >= self.WAVE_MP + reserve and \
                         self.scout_cost > 0:
                     if safe_siege and mp >= self.HOLD_DEMOS_MP and \
                             self.demolisher_cost > 0:

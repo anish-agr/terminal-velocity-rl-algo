@@ -353,13 +353,66 @@ class AlgoStrategy(gamelib.AlgoCore):
     # ------------------------------------------------------------------
     def _stage(self, game_state, cmds):
         info = self.config["unitInformation"]
+        attack_cell = "unset"   # lazily computed best working edge, once/turn
         for (kind, x, y) in cmds:
-            if kind in _STRUCT_KINDS or kind in _MOBILE_KINDS:
+            if kind in _STRUCT_KINDS:
                 game_state.attempt_spawn(info[kind]["shorthand"], [[x, y]])
+            elif kind in _MOBILE_KINDS:
+                loc = [x, y]
+                # OFFENSE (scout/demolisher) that self-destructs in our own
+                # half does nothing (ladder 15343256: 123 of the net's scouts
+                # died at y=12, 0 dmg). Reroute it to a lane that actually
+                # reaches the enemy. Interceptors are left alone -- dying in
+                # our half IS their job (screening).
+                if kind in (3, 4) and self._self_traps(game_state, loc):
+                    if attack_cell == "unset":
+                        attack_cell = self._best_attack_cell(game_state)
+                    if attack_cell is not None:
+                        loc = list(attack_cell)
+                game_state.attempt_spawn(info[kind]["shorthand"], [loc])
             elif kind == 6:
                 game_state.attempt_remove([[x, y]])
             elif kind == 7:
                 game_state.attempt_upgrade([[x, y]])
+
+    @staticmethod
+    def _reaches_enemy(path):
+        return bool(path) and len(path) >= 1 and path[-1][1] >= 14
+
+    def _self_traps(self, game_state, loc):
+        """True if a mobile unit spawned at loc self-destructs in our half
+        (its path never reaches the enemy side)."""
+        try:
+            if game_state.contains_stationary_unit(loc):
+                return False
+            return not self._reaches_enemy(game_state.find_path_to_edge(loc))
+        except Exception:
+            return False
+
+    def _best_attack_cell(self, game_state):
+        """Least-defended bottom-edge deploy cell whose path reaches the enemy
+        half; None if we are fully walled in (leave the net's choice as-is)."""
+        try:
+            gm = game_state.game_map
+            cells = gm.get_edge_locations(gm.BOTTOM_LEFT) + \
+                gm.get_edge_locations(gm.BOTTOM_RIGHT)
+        except Exception:
+            return None
+        best, best_danger = None, None
+        for c in cells:
+            try:
+                if game_state.contains_stationary_unit(c):
+                    continue
+                path = game_state.find_path_to_edge(c)
+                if not self._reaches_enemy(path):
+                    continue
+                danger = sum(len(game_state.get_attackers(cell, 0) or ())
+                             for cell in path)
+            except Exception:
+                continue
+            if best_danger is None or danger < best_danger:
+                best, best_danger = list(c), danger
+        return best
 
     def _reconstruct_enemy(self, prev_idx):
         """Enemy commands for the turn between frames prev_idx and prev_idx+1:

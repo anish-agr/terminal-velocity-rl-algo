@@ -225,3 +225,5 @@ Built on the [C1GamesStarterKit](https://github.com/correlation-one/C1GamesStart
 ## The full story
 
 **[REPORT.md](REPORT.md)** — the engineering report behind these numbers: why the engine was rebuilt from scratch and how 99.87% fidelity was measured, the game mechanics reverse-engineered from production replay data, what the training league actually did, and how the shipped algo plans a turn on the ranked server.
+
+**[terminal-engine-sim](https://github.com/anish-agr/terminal-engine-sim)** — the Rust simulator in `sim/`, extracted as a standalone crate with its mechanics spec and fidelity harness.

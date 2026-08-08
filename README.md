@@ -219,3 +219,9 @@ python scripts/scrape_replays.py scan <lo_id> <hi_id> [workers]
 ## Acknowledgments
 
 Built on the [C1GamesStarterKit](https://github.com/correlation-one/C1GamesStarterKit): `python-algo/`, `engine.jar`, and the game itself are Correlation One's (see `License.md`). The simulator (`sim/`), training system (`train/`), deployment stack (`deploy/`), and tooling (`scripts/`, `sparring/`, `bots/`) were built by the team during the competition.
+
+---
+
+## The full story
+
+**[REPORT.md](REPORT.md)** — the engineering report behind these numbers: why the engine was rebuilt from scratch and how 99.87% fidelity was actually measured, what the training league did, the complete deployment failure log (including why the neural net was benched 90 minutes before the deadline), and what won games in the end.

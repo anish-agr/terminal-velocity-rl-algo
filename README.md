@@ -224,4 +224,4 @@ Built on the [C1GamesStarterKit](https://github.com/correlation-one/C1GamesStart
 
 ## The full story
 
-**[REPORT.md](REPORT.md)** — the engineering report behind these numbers: why the engine was rebuilt from scratch and how 99.87% fidelity was actually measured, what the training league did, the complete deployment failure log (including why the neural net was benched 90 minutes before the deadline), and what won games in the end.
+**[REPORT.md](REPORT.md)** — the engineering report behind these numbers: why the engine was rebuilt from scratch and how 99.87% fidelity was measured, the game mechanics reverse-engineered from production replay data, what the training league actually did, and how the shipped algo plans a turn on the ranked server.
